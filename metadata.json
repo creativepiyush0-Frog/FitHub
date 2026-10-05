@@ -1,0 +1,6 @@
+{
+  "name": "IronPulse Gym Pro",
+  "description": "Enterprise Multi-Role Gym Management System with Super Admin, Branch Admin, Member portals, QR attendance, workout & diet plans, billing, inventory, and AI fitness coach.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
