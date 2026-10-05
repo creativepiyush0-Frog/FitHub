@@ -1,8 +1,9 @@
 import http from "node:http";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { handleApiRoute, sendJson, parseJsonBody } from "./src/api.js";
-import { db } from "./src/db.js";
+import { handleApiRoute, sendJson, parseJsonBody, getAuthUser } from "./src/api.js";
+import { dbService } from "./src/db.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,51 +37,114 @@ async function callGeminiApi(prompt, systemInstruction) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
-  // CORS headers
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    // CORS headers
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  // Health check
-  if (url.pathname === "/health" || url.pathname === "/api/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "healthy", timestamp: new Date().toISOString(), database: "ready" }));
-    return;
-  }
-
-  // AI Assistant Server Route
-  if (url.pathname === "/api/ai-assistant" && req.method === "POST") {
-    try {
-      const { question, member, language } = await parseJsonBody(req);
-      const sysInstruction = `You are FIT HUB's elite AI Fitness Coach. Context: Member is ${member?.name || "Athlete"}, Plan: ${member?.planName || "No active membership"}. Provide concise, actionable advice in ${language === "hi" ? "Hindi (हिन्दी)" : "English"}.`;
-      
-      const answer = await callGeminiApi(question, sysInstruction);
-      sendJson(res, 200, { answer });
-    } catch (err) {
-      sendJson(res, 500, { error: err.message });
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
     }
-    return;
-  }
 
-  // API router
-  if (url.pathname.startsWith("/api/")) {
-    const handled = await handleApiRoute(req, res, url);
-    if (handled) return;
-    sendJson(res, 404, { error: "API endpoint not found." });
-    return;
-  }
+    // Static PWA & public asset serving
+    const publicPath = path.join(__dirname, "public", url.pathname === "/" ? "" : url.pathname);
+    if (url.pathname !== "/" && fs.existsSync(publicPath) && fs.statSync(publicPath).isFile()) {
+      const ext = path.extname(publicPath).toLowerCase();
+      const contentTypes = {
+        ".json": "application/manifest+json; charset=utf-8",
+        ".webmanifest": "application/manifest+json; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css",
+        ".ico": "image/x-icon"
+      };
+      res.writeHead(200, { "Content-Type": contentTypes[ext] || "application/octet-stream" });
+      res.end(fs.readFileSync(publicPath));
+      return;
+    }
 
-  // Serve Frontend Single-Page App
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(renderWebApp());
+    // Health check
+    if (url.pathname === "/health" || url.pathname === "/api/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "healthy", timestamp: new Date().toISOString(), database: "ready" }));
+      return;
+    }
+
+    // AI Assistant Server Route (Protected & Isolated to Authenticated Member)
+    if (url.pathname === "/api/ai-assistant" && req.method === "POST") {
+      const user = await getAuthUser(req);
+      if (!user) {
+        sendJson(res, 401, { error: "Authentication required to consult the AI Coach." });
+        return;
+      }
+      try {
+        const { question, language } = await parseJsonBody(req);
+        // Only load the authenticated member's authorized profile, plan, streak, and goals
+        const memberData = await dbService.getMemberDashboard(user.id, user.token);
+        const athleteName = user.fullName || "Athlete";
+        const plan = memberData.planName || "No active membership";
+        const streak = memberData.streak || 0;
+        const goalsStr = (memberData.goals || []).map(g => `${g.goal_type || 'Milestone'}: ${g.target_value}`).join(", ") || "General strength & fitness";
+
+        const sysInstruction = `You are FIT HUB's elite AI Fitness Coach.
+Authorized Athlete Profile:
+- Name: ${athleteName}
+- Plan: ${plan} (${memberData.status})
+- Attendance Streak: ${streak} days
+- Active Goals: ${goalsStr}
+
+CRITICAL SECURITY RULE: You only have access to, and may only discuss, this authenticated athlete's own training, diet, and fitness metrics. Never access, discuss, or leak other gym members or administrative data.
+Provide concise, motivational, actionable coaching in ${language === "hi" ? "Hindi (हिन्दी)" : "English"}.`;
+
+        const answer = await callGeminiApi(question, sysInstruction);
+        sendJson(res, 200, { answer });
+      } catch (err) {
+        sendJson(res, 500, { error: err.message });
+      }
+      return;
+    }
+
+    // API router
+    if (url.pathname.startsWith("/api/")) {
+      try {
+        const handled = await handleApiRoute(req, res, url);
+        if (handled) return;
+        sendJson(res, 404, { error: "API endpoint not found." });
+      } catch (apiErr) {
+        console.error("[API Router Error]", apiErr);
+        sendJson(res, 500, { error: "Internal server error." });
+      }
+      return;
+    }
+
+    // Serve Frontend Single-Page App
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(renderWebApp());
+  } catch (err) {
+    console.error("[HTTP Server Error]", err);
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+      res.end("<h1>Internal Server Error</h1>");
+    }
+  }
+});
+
+server.on("error", (err) => {
+  console.error("[Fatal Server Error]", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[Uncaught Exception]", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[Unhandled Rejection]", reason);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
@@ -98,6 +162,14 @@ function renderWebApp() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FIT HUB — Your Complete Fitness Ecosystem</title>
   <meta name="description" content="Enterprise Gym Management System with Super Admin, Branch Admin, Member portals, QR attendance, workout & diet protocols, billing, and AI coach.">
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#0A0A0A">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FitHub">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -221,13 +293,6 @@ function renderWebApp() {
       </div>
 
       <div class="flex items-center space-x-2">
-        <!-- Quick Role Switcher -->
-        <select id="quickRoleSwitch" onchange="quickSwitchRole(this.value)" class="input-field text-xs px-2.5 py-1.5 font-semibold bg-[#171717] border border-[#393939]">
-          <option value="MEMBER">Role: Member</option>
-          <option value="GYM_ADMIN">Role: Gym Admin</option>
-          <option value="SUPER_ADMIN">Role: Super Admin</option>
-        </select>
-
         <!-- Notification Bell -->
         <button onclick="openModal('notificationsModal')" class="relative p-2 rounded-xl bg-[#171717] border border-[#393939] text-[#B5B5B5] hover:text-white">
           <i class="fa-solid fa-bell text-sm"></i>
@@ -239,12 +304,23 @@ function renderWebApp() {
           <span id="langBtnText">हिन्दी</span>
         </button>
 
+        <!-- Install PWA Button -->
+        <button id="pwaInstallBtn" onclick="installPWA()" class="hidden px-2.5 py-1 rounded-xl bg-[#F0441D] text-white text-xs font-bold hover:bg-[#FF542B] transition flex items-center gap-1.5 shadow-md">
+          <i class="fa-solid fa-download"></i> <span class="hidden sm:inline">Install App</span>
+        </button>
+
         <!-- Logout Button -->
         <button id="logoutBtn" onclick="performLogout()" class="hidden px-2.5 py-1 rounded-xl bg-[#242424] border border-[#393939] text-xs text-[#858585] hover:text-[#F0441D]">
           <i class="fa-solid fa-right-from-bracket"></i>
         </button>
       </div>
     </header>
+
+    <!-- Offline Connectivity Banner -->
+    <div id="offlineBanner" class="hidden bg-amber-600 text-white text-xs font-bold py-1.5 px-4 text-center rounded-xl mb-4 flex items-center justify-center gap-2 border border-amber-500 shadow-lg">
+      <span class="w-2 h-2 rounded-full bg-white animate-pulse"></span>
+      Offline Mode — Cached FitHub data is active. Reconnect to sync turnstile check-ins and payments.
+    </div>
 
     <!-- VIEW 1: ROLE SELECTION SCREEN -->
     <div id="view-role_select" class="w-full max-w-md mx-auto my-auto py-8 space-y-6">
@@ -305,24 +381,18 @@ function renderWebApp() {
       </div>
     </div>
 
-    <!-- VIEW 2: AUTHENTICATION SCREEN (LOGIN / REGISTER) -->
-    <div id="view-login" class="w-full max-w-md mx-auto my-auto py-8 space-y-5 hidden">
-      <button onclick="navigateTo('role_select')" class="text-xs text-[#AAAAAA] hover:text-white flex items-center">
+    <!-- VIEW 2: AUTHENTICATION SCREEN (PRODUCTION LOGIN) -->
+    <div id="view-login" class="w-full max-w-md mx-auto my-auto py-8 space-y-6 hidden">
+      <button onclick="navigateTo('role_select')" class="text-xs text-[#AAAAAA] hover:text-white flex items-center transition">
         <i class="fa-solid fa-arrow-left mr-1.5"></i> Back to roles
       </button>
 
-      <div class="text-center space-y-1">
+      <div class="text-center space-y-1.5">
         <div class="fithub-logo text-3xl">
           <span class="fit">FIT</span><span class="hub">HUB</span>
         </div>
         <h2 id="loginPageTitle" class="fithub-heading text-2xl text-white mt-1">WELCOME BACK</h2>
         <p id="loginSubtitle" class="text-xs text-[#B5B5B5]">Sign in to your authenticated account</p>
-      </div>
-
-      <!-- Auth Tabs: Sign In / Register -->
-      <div class="flex border-b border-[#393939] text-xs font-bold">
-        <button id="authTabSignIn" onclick="setAuthMode('signin')" class="flex-1 py-2 border-b-2 border-[#F0441D] text-white">SIGN IN</button>
-        <button id="authTabRegister" onclick="setAuthMode('register')" class="flex-1 py-2 text-[#858585] hover:text-white">REGISTER (NEW MEMBER)</button>
       </div>
 
       <div id="authAlert" class="hidden p-3 rounded-xl text-xs font-semibold bg-red-500/20 text-red-300 border border-red-500/30"></div>
@@ -334,38 +404,29 @@ function renderWebApp() {
         </div>
 
         <div class="space-y-1.5">
-          <label class="text-[10px] uppercase font-bold text-[#858585]">Email Address</label>
-          <input type="email" id="authEmail" class="input-field w-full p-3 text-xs" placeholder="member@example.com" required>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Email / Mobile</label>
+          <input type="text" id="authEmail" class="input-field w-full p-3 text-xs" placeholder="member@example.com or phone" required autocomplete="username">
         </div>
 
         <div class="space-y-1.5">
-          <label class="text-[10px] uppercase font-bold text-[#858585]">Password</label>
-          <input type="password" id="authPassword" value="password123" class="input-field w-full p-3 text-xs" placeholder="••••••••" required>
+          <div class="flex items-center justify-between">
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Password</label>
+            <a href="#" onclick="showForgotPassword(event)" class="text-[11px] text-[#858585] hover:text-[#F0441D] transition">Forgot Password?</a>
+          </div>
+          <input type="password" id="authPassword" class="input-field w-full p-3 text-xs" placeholder="••••••••" required autocomplete="current-password">
         </div>
 
-        <button type="submit" id="authSubmitBtn" class="btn-orange w-full py-3.5 text-sm uppercase tracking-wider shadow">
+        <button type="submit" id="authSubmitBtn" class="btn-orange w-full py-3.5 text-sm uppercase tracking-wider font-bold shadow">
           SIGN IN
         </button>
-      </form>
 
-      <!-- Demo Accounts Card -->
-      <div class="glass-card p-4 bg-[#171717] border border-[#393939] text-xs">
-        <div class="flex items-center justify-between text-[11px] font-bold text-[#F0441D]">
-          <span><i class="fa-solid fa-key mr-1"></i> TEST CREDENTIALS</span>
-          <span class="text-[#858585]">Password: password123</span>
-        </div>
-        <div class="grid grid-cols-3 gap-2 mt-2.5 text-[10px]">
-          <button onclick="fillAuthCredentials('demo.member@fithub.com', 'password123', 'MEMBER')" class="bg-[#242424] hover:bg-[#2c2c2c] p-2 rounded-lg border border-[#393939] text-center font-bold">
-            Demo Member
-          </button>
-          <button onclick="fillAuthCredentials('admin@downtown.fithub.com', 'password123', 'GYM_ADMIN')" class="bg-[#242424] hover:bg-[#2c2c2c] p-2 rounded-lg border border-[#393939] text-center font-bold">
-            Gym Admin
-          </button>
-          <button onclick="fillAuthCredentials('platform@fithub.com', 'password123', 'SUPER_ADMIN')" class="bg-[#242424] hover:bg-[#2c2c2c] p-2 rounded-lg border border-[#393939] text-center font-bold">
-            Super Admin
+        <div class="text-center pt-2">
+          <span id="authTogglePrompt" class="text-xs text-[#858585]">Don't have an account?</span>
+          <button type="button" id="authToggleBtn" onclick="toggleAuthMode()" class="text-xs text-[#F0441D] hover:underline font-bold ml-1">
+            Create Account
           </button>
         </div>
-      </div>
+      </form>
     </div>
 
     <!-- VIEW 3: MAIN APPLICATION DASHBOARDS -->
@@ -606,11 +667,20 @@ function renderWebApp() {
             <h2 class="fithub-heading text-2xl text-white mt-0.5">FIT HUB DOWNTOWN CENTRAL</h2>
             <p class="text-xs text-[#B5B5B5]">Plot 14, MG Road, Nariman Point • Mumbai</p>
           </div>
-          <div class="flex items-center space-x-2">
-            <button onclick="openModal('recordExpenseModal')" class="btn-secondary text-xs px-3 py-2">
-              <i class="fa-solid fa-receipt mr-1"></i> Add Expense
+          <div class="flex flex-wrap items-center gap-2">
+            <button onclick="downloadReport('members')" class="btn-secondary text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-file-csv mr-1 text-[#F0441D]"></i> Roster CSV
             </button>
-            <button onclick="openModal('addLeadModal')" class="btn-orange text-xs px-3 py-2">
+            <button onclick="downloadReport('inventory')" class="btn-secondary text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-boxes-stacked mr-1 text-[#F0441D]"></i> Stock CSV
+            </button>
+            <button onclick="triggerAutomations()" class="btn-secondary text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-bolt mr-1 text-amber-400"></i> Run Jobs
+            </button>
+            <button onclick="openModal('addInventoryModal')" class="btn-secondary text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-box-open mr-1"></i> New SKU
+            </button>
+            <button onclick="openModal('addLeadModal')" class="btn-orange text-xs px-2.5 py-1.5 font-semibold">
               <i class="fa-solid fa-user-plus mr-1"></i> New Lead
             </button>
           </div>
@@ -675,6 +745,104 @@ function renderWebApp() {
           <div class="glass-card p-5">
             <h3 class="fithub-heading text-lg text-white mb-3">SUPPLEMENTS & INVENTORY</h3>
             <div id="admInventoryContainer" class="space-y-2 text-xs"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============================================================= -->
+      <!-- 2B. TRAINER DASHBOARD CONTAINER -->
+      <!-- ============================================================= -->
+      <div id="subview-trainer" class="space-y-6 hidden">
+        <div class="flex flex-wrap items-center justify-between gap-4 border-b border-[#393939] pb-4">
+          <div>
+            <span class="text-xs text-[#F0441D] font-bold uppercase tracking-wider block">ATHLETE COACHING & SESSIONS</span>
+            <h2 id="trainerPortalHeading" class="fithub-heading text-2xl text-white mt-0.5">TRAINER PERFORMANCE HUB</h2>
+            <p id="trainerPortalSub" class="text-xs text-[#B5B5B5]">Coach Rahul • Strength & Conditioning / Hypertrophy Specialist</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button onclick="fetchTrainerDashboard()" class="btn-secondary text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-rotate mr-1"></i> Refresh
+            </button>
+            <button onclick="openModal('assignRoutineModal')" class="btn-orange text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-dumbbell mr-1"></i> Assign Routine
+            </button>
+            <button onclick="openModal('assignMacroModal')" class="btn-secondary text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-utensils mr-1"></i> Set Macros
+            </button>
+            <button onclick="openModal('addCoachingNoteModal')" class="btn-secondary text-xs px-2.5 py-1.5 font-semibold">
+              <i class="fa-solid fa-clipboard-check mr-1 text-[#F0441D]"></i> Log Note
+            </button>
+          </div>
+        </div>
+
+        <!-- Trainer KPI Grid -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3.5">
+          <div class="glass-card p-4">
+            <span class="text-[10px] text-[#858585] uppercase font-bold block">ASSIGNED ATHLETES</span>
+            <span id="trainerActiveClients" class="text-2xl font-black text-white mt-1 block">0</span>
+            <span class="text-[10px] text-emerald-400 font-bold block mt-0.5">Active Trainees</span>
+          </div>
+          <div class="glass-card p-4">
+            <span class="text-[10px] text-[#858585] uppercase font-bold block">SESSIONS TODAY</span>
+            <span id="trainerSessionsToday" class="text-2xl font-black text-[#F0441D] mt-1 block">0</span>
+            <span class="text-[10px] text-[#B5B5B5] font-bold block mt-0.5">1-on-1 PT Consultations</span>
+          </div>
+          <div class="glass-card p-4">
+            <span class="text-[10px] text-[#858585] uppercase font-bold block">AVG CLIENT ADHERENCE</span>
+            <span id="trainerAdherenceRate" class="text-2xl font-black text-emerald-400 mt-1 block">93%</span>
+            <span class="text-[10px] text-white font-bold block mt-0.5">Workout Completion</span>
+          </div>
+          <div class="glass-card p-4">
+            <span class="text-[10px] text-[#858585] uppercase font-bold block">ACTIVE PROTOCOLS</span>
+            <span id="trainerActiveProtocols" class="text-2xl font-black text-white mt-1 block">4</span>
+            <span class="text-[10px] text-[#B5B5B5] font-bold block mt-0.5">Push/Pull/Legs Splits</span>
+          </div>
+        </div>
+
+        <!-- Assigned Trainees & Training Logs -->
+        <div class="glass-card p-5">
+          <div class="flex justify-between items-center mb-3">
+            <h3 class="fithub-heading text-lg text-white">MY ATHLETES & TRAINING PROGRESS</h3>
+            <span class="text-xs text-[#858585]">Authorized Trainee Fitness Data Only</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left text-xs">
+              <thead class="text-[#858585] uppercase border-b border-[#393939] text-[10px]">
+                <tr>
+                  <th class="py-2.5">Athlete</th>
+                  <th>Current Goal</th>
+                  <th>Assigned Routine</th>
+                  <th>Macro Protocol</th>
+                  <th>Streak</th>
+                  <th>Adherence</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="trainerTraineesTableBody" class="divide-y divide-[#2c2c2c] text-[#B5B5B5]">
+                <tr><td colspan="7" class="py-4 text-center text-[#858585]">Loading trainees...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Schedule & Feedback Grid -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- PT Schedule & Availability -->
+          <div class="glass-card p-5">
+            <div class="flex justify-between items-center mb-3">
+              <h3 class="fithub-heading text-lg text-white">TODAY'S PT SCHEDULE & AVAILABILITY</h3>
+              <span class="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded font-bold">On Duty</span>
+            </div>
+            <div id="trainerScheduleContainer" class="space-y-2 text-xs"></div>
+          </div>
+
+          <!-- Coaching Feedback & Progress Notes -->
+          <div class="glass-card p-5">
+            <div class="flex justify-between items-center mb-3">
+              <h3 class="fithub-heading text-lg text-white">COACHING FEEDBACK & LOGS</h3>
+              <button onclick="openModal('addCoachingNoteModal')" class="text-xs text-[#F0441D] hover:underline font-bold">+ New Note</button>
+            </div>
+            <div id="trainerFeedbackContainer" class="space-y-2 text-xs"></div>
           </div>
         </div>
       </div>
@@ -848,6 +1016,309 @@ function renderWebApp() {
     </div>
   </div>
 
+  <!-- Modal: Add Inventory SKU -->
+  <div id="addInventoryModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-sm p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">NEW INVENTORY SKU</h3>
+        <button onclick="closeModal('addInventoryModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Product Name</label>
+          <input type="text" id="invNameInput" placeholder="e.g. Whey Protein 1kg" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">SKU Code</label>
+          <input type="text" id="invSkuInput" placeholder="e.g. SUP-WHEY-100" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Initial Stock</label>
+            <input type="number" id="invStockInput" value="10" class="input-field w-full p-2.5 text-xs">
+          </div>
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Min Alert Qty</label>
+            <input type="number" id="invMinInput" value="5" class="input-field w-full p-2.5 text-xs">
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Cost Price (₹)</label>
+            <input type="number" id="invCostInput" value="1500" class="input-field w-full p-2.5 text-xs">
+          </div>
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Retail Price (₹)</label>
+            <input type="number" id="invPriceInput" value="2499" class="input-field w-full p-2.5 text-xs">
+          </div>
+        </div>
+        <button onclick="apiAddInventory()" class="btn-orange w-full py-2.5 text-xs font-bold">
+          Save Product SKU
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Add CRM Lead -->
+  <div id="addLeadModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-sm p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">NEW CRM PROSPECT</h3>
+        <button onclick="closeModal('addLeadModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Prospect Name</label>
+          <input type="text" id="leadNameInput" placeholder="Full name" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Phone / WhatsApp</label>
+          <input type="tel" id="leadPhoneInput" placeholder="+91 98765 00000" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Email (Optional)</label>
+          <input type="email" id="leadEmailInput" placeholder="prospect@example.com" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Interested Plan</label>
+          <select id="leadPlanInput" class="input-field w-full p-2.5 text-xs">
+            <option value="Elite 12-Month Pro">Elite 12-Month Pro</option>
+            <option value="Gold 3-Months">Gold 3-Months</option>
+            <option value="Silver 1-Month">Silver 1-Month</option>
+            <option value="Personal Training Pass">Personal Training Pass</option>
+          </select>
+        </div>
+        <button onclick="apiAddLead()" class="btn-orange w-full py-2.5 text-xs font-bold">
+          Register Prospect
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Stock In / Out Operations -->
+  <div id="stockMovementModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-sm p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">STOCK IN / OUT OPERATION</h3>
+        <button onclick="closeModal('stockMovementModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Select SKU / Product</label>
+          <select id="stockMoveProductSelect" class="input-field w-full p-2.5 text-xs"></select>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Movement Type</label>
+          <select id="stockMoveTypeSelect" class="input-field w-full p-2.5 text-xs">
+            <option value="STOCK_IN">Stock In (Restock / Purchase)</option>
+            <option value="STOCK_OUT">Stock Out (Retail Sale / Consumption)</option>
+            <option value="ADJUSTMENT">Inventory Audit Adjustment</option>
+            <option value="RETURN">Customer Return / Restock</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Quantity Units</label>
+          <input type="number" id="stockMoveQtyInput" value="5" min="1" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Reason / Reference</label>
+          <input type="text" id="stockMoveReasonInput" placeholder="e.g. Supplier Shipment PO-982" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <button onclick="apiRecordStockMovement()" class="btn-orange w-full py-2.5 text-xs font-bold">
+          Submit Stock Movement
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Assign Routine to Athlete -->
+  <div id="assignRoutineModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-md p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">ASSIGN WORKOUT ROUTINE</h3>
+        <button onclick="closeModal('assignRoutineModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Select Athlete</label>
+          <select id="routineAthleteSelect" class="input-field w-full p-2.5 text-xs"></select>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Routine Title</label>
+          <input type="text" id="routineTitleInput" value="Pro Strength & Hypertrophy Split" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Primary Exercise 1</label>
+          <div class="grid grid-cols-3 gap-2">
+            <input type="text" id="routineEx1Name" value="Barbell Bench Press" placeholder="Exercise" class="input-field p-2 text-xs">
+            <input type="text" id="routineEx1Sets" value="4 sets x 8-10 reps" placeholder="Sets/Reps" class="input-field p-2 text-xs">
+            <input type="number" id="routineEx1Weight" value="80" placeholder="Weight kg" class="input-field p-2 text-xs">
+          </div>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Primary Exercise 2</label>
+          <div class="grid grid-cols-3 gap-2">
+            <input type="text" id="routineEx2Name" value="Incline DB Press" placeholder="Exercise" class="input-field p-2 text-xs">
+            <input type="text" id="routineEx2Sets" value="3 sets x 10-12 reps" placeholder="Sets/Reps" class="input-field p-2 text-xs">
+            <input type="number" id="routineEx2Weight" value="28" placeholder="Weight kg" class="input-field p-2 text-xs">
+          </div>
+        </div>
+        <button onclick="apiTrainerAssignWorkout()" class="btn-orange w-full py-2.5 text-xs font-bold">
+          Assign Routine to Athlete
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Assign Macro Protocol -->
+  <div id="assignMacroModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-sm p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">SET MACRO NUTRITION PROTOCOL</h3>
+        <button onclick="closeModal('assignMacroModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Select Athlete</label>
+          <select id="macroAthleteSelect" class="input-field w-full p-2.5 text-xs"></select>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Target Calories</label>
+            <input type="number" id="macroCalsInput" value="2600" class="input-field w-full p-2.5 text-xs">
+          </div>
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Protein (g)</label>
+            <input type="number" id="macroProteinInput" value="180" class="input-field w-full p-2.5 text-xs">
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Carbohydrates (g)</label>
+            <input type="number" id="macroCarbsInput" value="280" class="input-field w-full p-2.5 text-xs">
+          </div>
+          <div>
+            <label class="text-[10px] uppercase font-bold text-[#858585]">Fats (g)</label>
+            <input type="number" id="macroFatInput" value="65" class="input-field w-full p-2.5 text-xs">
+          </div>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Hydration Target (ml)</label>
+          <input type="number" id="macroWaterInput" value="3500" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <button onclick="apiTrainerAssignDiet()" class="btn-orange w-full py-2.5 text-xs font-bold">
+          Prescribe Macro Protocol
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Add Coaching Note -->
+  <div id="addCoachingNoteModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-sm p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">LOG COACHING NOTE</h3>
+        <button onclick="closeModal('addCoachingNoteModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Select Athlete</label>
+          <select id="noteAthleteSelect" class="input-field w-full p-2.5 text-xs"></select>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Feedback & Form Correction</label>
+          <textarea id="coachingNoteText" rows="3" placeholder="Form notes, progress feedback, or motivational cues..." class="input-field w-full p-2.5 text-xs"></textarea>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Session Rating</label>
+          <select id="coachingNoteRating" class="input-field w-full p-2.5 text-xs">
+            <option value="5">⭐⭐⭐⭐⭐ Elite Performance (5/5)</option>
+            <option value="4">⭐⭐⭐⭐ Solid Progression (4/5)</option>
+            <option value="3">⭐⭐⭐ Good Effort, Form Needs Polish (3/5)</option>
+          </select>
+        </div>
+        <button onclick="apiTrainerAddFeedback()" class="btn-orange w-full py-2.5 text-xs font-bold">
+          Save Coaching Feedback
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: CRM Follow-Up Note -->
+  <div id="leadFollowUpModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-sm p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">CRM PROSPECT FOLLOW-UP</h3>
+        <button onclick="closeModal('leadFollowUpModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3">
+        <input type="hidden" id="followUpLeadId">
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Stage Status</label>
+          <select id="followUpStageSelect" class="input-field w-full p-2.5 text-xs">
+            <option value="NEW">NEW</option>
+            <option value="CONTACTED">CONTACTED</option>
+            <option value="TRIAL">TRIAL</option>
+            <option value="INTERESTED">INTERESTED</option>
+            <option value="CONVERTED">CONVERTED (Active Member)</option>
+            <option value="LOST">LOST</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Next Follow-up Date</label>
+          <input type="date" id="followUpDateInput" class="input-field w-full p-2.5 text-xs">
+        </div>
+        <div>
+          <label class="text-[10px] uppercase font-bold text-[#858585]">Interaction Notes</label>
+          <textarea id="followUpNotesInput" rows="3" placeholder="Discussion notes, goals discussed, trial scheduled..." class="input-field w-full p-2.5 text-xs"></textarea>
+        </div>
+        <button onclick="apiSubmitLeadFollowUp()" class="btn-orange w-full py-2.5 text-xs font-bold">
+          Update Prospect Status
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Printable / PDF-Ready Reports Dialog -->
+  <div id="reportsPrintModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-2xl p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+      <div class="flex justify-between items-center border-b border-[#393939] pb-3">
+        <div class="flex items-center space-x-2">
+          <span class="fithub-logo text-xl"><span class="fit">FIT</span><span class="hub">HUB</span></span>
+          <span class="text-xs text-[#858585]">| Executive Operations Report</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="window.print()" class="btn-orange text-xs px-3 py-1 font-bold">
+            <i class="fa-solid fa-print mr-1"></i> Print / Save PDF
+          </button>
+          <button onclick="closeModal('reportsPrintModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+        </div>
+      </div>
+      <div id="reportsPrintContent" class="space-y-4 text-xs"></div>
+    </div>
+  </div>
+
+  <!-- Modal: iOS PWA Installation Guide -->
+  <div id="pwaIosModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="glass-card w-full max-w-sm p-6 space-y-4">
+      <div class="flex justify-between items-center">
+        <h3 class="fithub-heading text-lg text-white">INSTALL FITHUB ON IOS</h3>
+        <button onclick="closeModal('pwaIosModal')" class="text-[#858585] hover:text-white"><i class="fa-solid fa-xmark text-lg"></i></button>
+      </div>
+      <div class="space-y-3 text-xs text-[#B5B5B5]">
+        <p>Install FitHub on your iPhone or iPad home screen for instant full-screen access:</p>
+        <ol class="list-decimal list-inside space-y-1.5 text-white">
+          <li>Tap the <strong class="text-[#F0441D]">Share</strong> button in Safari's bottom toolbar (<i class="fa-solid fa-arrow-up-from-bracket"></i>).</li>
+          <li>Scroll down and tap <strong class="text-white">Add to Home Screen</strong>.</li>
+          <li>Tap <strong class="text-[#F0441D]">Add</strong> in the top-right corner.</li>
+        </ol>
+        <button onclick="closeModal('pwaIosModal')" class="btn-secondary w-full py-2 mt-2 font-semibold">
+          Got it
+        </button>
+      </div>
+    </div>
+  </div>
+
   <!-- CLIENT LOGIC & REST API BRIDGE -->
   <script>
     let authToken = localStorage.getItem('fithub_auth_token') || null;
@@ -887,61 +1358,81 @@ function renderWebApp() {
     }
 
     function selectRoleAndGoToLogin(role) {
-      currentRole = role;
-      document.getElementById('quickRoleSwitch').value = role;
-      const titleEl = document.getElementById('loginPageTitle');
-
-      if (role === 'MEMBER') {
-        titleEl.innerText = 'MEMBER PORTAL';
-      } else if (role === 'GYM_ADMIN') {
-        titleEl.innerText = 'GYM OWNER / ADMIN';
-      } else if (role === 'SUPER_ADMIN') {
-        titleEl.innerText = 'SUPER ADMIN PORTAL';
-      }
-
       setAuthMode('signin');
       navigateTo('login');
     }
 
-    function setAuthMode(mode) {
-      authMode = mode;
-      document.getElementById('authTabSignIn').className = mode === 'signin' ? 'flex-1 py-2 border-b-2 border-[#F0441D] text-white font-bold' : 'flex-1 py-2 text-[#858585] hover:text-white';
-      document.getElementById('authTabRegister').className = mode === 'register' ? 'flex-1 py-2 border-b-2 border-[#F0441D] text-white font-bold' : 'flex-1 py-2 text-[#858585] hover:text-white';
-      document.getElementById('fullNameGroup').classList.toggle('hidden', mode !== 'register');
-      document.getElementById('authSubmitBtn').innerText = mode === 'signin' ? 'SIGN IN' : 'CREATE ACCOUNT & START';
-      document.getElementById('authAlert').classList.add('hidden');
+    function toggleAuthMode() {
+      setAuthMode(authMode === 'signin' ? 'register' : 'signin');
     }
 
-    function fillAuthCredentials(email, password, role) {
-      currentRole = role;
-      document.getElementById('quickRoleSwitch').value = role;
-      document.getElementById('authEmail').value = email;
-      document.getElementById('authPassword').value = password;
-      setAuthMode('signin');
+    function setAuthMode(mode) {
+      authMode = mode;
+      const isReg = mode === 'register';
+      const fullNameGroup = document.getElementById('fullNameGroup');
+      if (fullNameGroup) fullNameGroup.classList.toggle('hidden', !isReg);
+      
+      const titleEl = document.getElementById('loginPageTitle');
+      if (titleEl) titleEl.innerText = isReg ? 'CREATE ACCOUNT' : 'WELCOME BACK';
+
+      const subtitleEl = document.getElementById('loginSubtitle');
+      if (subtitleEl) subtitleEl.innerText = isReg ? 'Register your clean member account' : 'Sign in to your authenticated account';
+
+      const submitBtn = document.getElementById('authSubmitBtn');
+      if (submitBtn) submitBtn.innerText = isReg ? 'CREATE ACCOUNT' : 'SIGN IN';
+
+      const togglePrompt = document.getElementById('authTogglePrompt');
+      if (togglePrompt) togglePrompt.innerText = isReg ? 'Already have an account?' : "Don't have an account?";
+
+      const toggleBtn = document.getElementById('authToggleBtn');
+      if (toggleBtn) toggleBtn.innerText = isReg ? 'Sign In' : 'Create Account';
+
+      const alertBox = document.getElementById('authAlert');
+      if (alertBox) alertBox.classList.add('hidden');
+    }
+
+    function showForgotPassword(e) {
+      if (e) e.preventDefault();
+      const alertBox = document.getElementById('authAlert');
+      if (!alertBox) return;
+      alertBox.className = 'p-3 rounded-xl text-xs font-semibold bg-zinc-800 text-[#B5B5B5] border border-[#393939]';
+      alertBox.innerText = 'To reset your password, contact your gym administrator or platform support at support@fithub.com.';
+      alertBox.classList.remove('hidden');
     }
 
     async function performAuth() {
       const email = document.getElementById('authEmail').value.trim();
       const password = document.getElementById('authPassword').value;
-      const fullName = document.getElementById('authFullName').value.trim();
+      const fullName = document.getElementById('authFullName')?.value?.trim() || '';
       const alertBox = document.getElementById('authAlert');
+      alertBox.className = 'hidden p-3 rounded-xl text-xs font-semibold bg-red-500/20 text-red-300 border border-red-500/30';
       alertBox.classList.add('hidden');
+
+      if (!email || !password) {
+        alertBox.innerText = 'Email and password are required.';
+        alertBox.classList.remove('hidden');
+        return;
+      }
 
       try {
         let res;
         if (authMode === 'register') {
-          res = await apiRequest('/api/auth/register', 'POST', { email, password, fullName, role: currentRole });
+          res = await apiRequest('/api/auth/register', 'POST', { email, password, fullName });
         } else {
-          res = await apiRequest('/api/auth/login', 'POST', { email, password, expectedRole: currentRole });
+          // Role is determined securely from the authenticated Supabase profile on the server.
+          // The user does NOT manually select a role during login.
+          res = await apiRequest('/api/auth/login', 'POST', { email, password });
         }
 
         authToken = res.token;
         currentUser = res.user;
         localStorage.setItem('fithub_auth_token', authToken);
 
-        quickSwitchRole(currentUser.role);
+        // Automatically route user to permitted area based on verified Supabase account role
+        await routeUserToDashboard(currentUser.role);
       } catch (err) {
-        alertBox.innerText = err.message;
+        alertBox.className = 'p-3 rounded-xl text-xs font-semibold bg-red-500/20 text-red-300 border border-red-500/30';
+        alertBox.innerText = err.message || 'Authentication failed.';
         alertBox.classList.remove('hidden');
       }
     }
@@ -949,27 +1440,45 @@ function renderWebApp() {
     function performLogout() {
       authToken = null;
       currentUser = null;
+      currentRole = 'MEMBER';
       localStorage.removeItem('fithub_auth_token');
-      navigateTo('role_select');
+      const emailInput = document.getElementById('authEmail');
+      const passInput = document.getElementById('authPassword');
+      if (emailInput) emailInput.value = '';
+      if (passInput) passInput.value = '';
+      setAuthMode('signin');
+      navigateTo('login');
     }
 
-    async function quickSwitchRole(role) {
-      currentRole = role;
-      document.getElementById('quickRoleSwitch').value = role;
-      document.getElementById('subview-member').classList.toggle('hidden', role !== 'MEMBER');
-      document.getElementById('subview-admin').classList.toggle('hidden', role !== 'GYM_ADMIN');
-      document.getElementById('subview-superadmin').classList.toggle('hidden', role !== 'SUPER_ADMIN');
+    async function routeUserToDashboard(role) {
+      const normalizedRole = (role || 'MEMBER').toUpperCase();
+      currentRole = normalizedRole;
+
+      const isMember = normalizedRole === 'MEMBER';
+      const isAdmin = ['GYM_ADMIN', 'GYM_OWNER'].includes(normalizedRole);
+      const isSuperAdmin = normalizedRole === 'SUPER_ADMIN';
+      const isTrainer = normalizedRole === 'TRAINER';
+
+      document.getElementById('subview-member')?.classList.toggle('hidden', !isMember);
+      document.getElementById('subview-admin')?.classList.toggle('hidden', !isAdmin);
+      document.getElementById('subview-superadmin')?.classList.toggle('hidden', !isSuperAdmin);
+      document.getElementById('subview-trainer')?.classList.toggle('hidden', !isTrainer);
 
       navigateTo('dashboard');
 
-      if (role === 'MEMBER') {
+      if (isMember) {
         await fetchMemberDashboard();
-      } else if (role === 'GYM_ADMIN') {
+      } else if (isAdmin) {
         await fetchAdminDashboard();
-      } else if (role === 'SUPER_ADMIN') {
+      } else if (isSuperAdmin) {
         await fetchSuperAdminDashboard();
+      } else if (isTrainer) {
+        await fetchTrainerDashboard();
       }
     }
+
+    // Compatibility alias
+    const quickSwitchRole = routeUserToDashboard;
 
     // ---------------- MEMBER API CALLS ----------------
     async function fetchMemberDashboard() {
@@ -982,18 +1491,62 @@ function renderWebApp() {
       }
     }
 
-    function renderMemberDashboardUI(d) {
-      document.getElementById('memberProfileName').innerText = d.profile.fullName;
-      document.getElementById('memberProfileEmail').innerText = d.profile.email;
+    function renderMemberDashboardUI(raw) {
+      if (!raw) return;
+      const mem = raw.member || {};
+      const profile = raw.profile || {
+        id: mem.id || currentUser?.id || '',
+        fullName: mem.fullName || mem.name || currentUser?.fullName || 'Athlete',
+        email: mem.email || currentUser?.email || '',
+        role: mem.role || currentUser?.role || 'MEMBER'
+      };
+      const membership = raw.membership || {
+        planName: mem.planName || 'No active membership',
+        status: mem.status || 'INACTIVE',
+        remainingDays: typeof mem.remainingDays === 'number' ? mem.remainingDays : 0,
+        expiryDate: mem.expiryDate || 'No expiry'
+      };
+      const attendance = raw.attendance || {
+        streak: typeof mem.streak === 'number' ? mem.streak : 0,
+        totalCheckIns: typeof mem.attendanceCount === 'number' ? mem.attendanceCount : 0,
+        todayAttendance: mem.todayAttended ? 1 : 0,
+        monthlyAttendancePercent: mem.monthlyPercent ? parseInt(mem.monthlyPercent, 10) : 0,
+        logs: mem.attendanceLogs || []
+      };
+
+      const d = {
+        profile,
+        membership,
+        attendance,
+        workout: raw.workout !== undefined ? raw.workout : (mem.workouts?.[0] || null),
+        diet: raw.diet !== undefined ? raw.diet : (mem.diet || null),
+        progressList: raw.progressList || mem.progress || [],
+        goalsList: raw.goalsList || mem.goals || [],
+        qrPass: raw.qrPass || {
+          active: (membership.remainingDays > 0),
+          code: 'FH-' + ((profile.id || 'MEM').slice(0, 8).toUpperCase())
+        },
+        bookingsList: raw.bookingsList || mem.bookings || [],
+        invoicesList: raw.invoicesList || mem.payments || [],
+        paymentsList: raw.paymentsList || mem.payments || [],
+        notificationsList: raw.notificationsList || mem.notifications || []
+      };
+
+      const nameEl = document.getElementById('memberProfileName');
+      if (nameEl) nameEl.innerText = d.profile.fullName || 'Athlete';
+      const emailEl = document.getElementById('memberProfileEmail');
+      if (emailEl) emailEl.innerText = d.profile.email || '';
 
       // Status badge
       const badge = document.getElementById('memberStatusBadge');
-      if (d.membership.remainingDays > 0) {
-        badge.className = 'text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
-        badge.innerText = 'ACTIVE MEMBER';
-      } else {
-        badge.className = 'text-[10px] font-bold px-2 py-0.5 rounded bg-zinc-800 text-[#B5B5B5] border border-[#393939]';
-        badge.innerText = 'No active membership';
+      if (badge) {
+        if (d.membership.remainingDays > 0) {
+          badge.className = 'text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+          badge.innerText = 'ACTIVE MEMBER';
+        } else {
+          badge.className = 'text-[10px] font-bold px-2 py-0.5 rounded bg-zinc-800 text-[#B5B5B5] border border-[#393939]';
+          badge.innerText = 'No active membership';
+        }
       }
 
       // Hero Card
@@ -1003,36 +1556,43 @@ function renderWebApp() {
       const heroStreak = document.getElementById('heroStreakCount');
       const heroExpiry = document.getElementById('heroExpiryText');
 
-      heroDays.innerText = d.membership.remainingDays;
-      heroStreak.innerText = d.attendance.streak;
+      if (heroDays) heroDays.innerText = d.membership.remainingDays;
+      if (heroStreak) heroStreak.innerText = d.attendance.streak;
 
-      if (d.membership.remainingDays > 0) {
-        heroCard.className = 'glass-card p-6 bg-gradient-to-r from-[#171717] to-[#251b17] border-l-4 border-[#F0441D]';
-        heroTitle.innerText = d.membership.planName.toUpperCase();
-        heroDays.className = 'text-2xl font-black text-[#F0441D]';
-        heroExpiry.innerText = d.membership.remainingDays + ' days left';
-      } else {
-        heroCard.className = 'glass-card p-6 bg-gradient-to-r from-[#171717] to-[#1D1D1D] border-l-4 border-[#393939]';
-        heroTitle.innerText = 'NO ACTIVE MEMBERSHIP';
-        heroDays.className = 'text-2xl font-black text-[#858585]';
-        heroExpiry.innerText = 'No expiry';
+      if (heroCard && heroTitle && heroDays && heroExpiry) {
+        if (d.membership.remainingDays > 0) {
+          heroCard.className = 'glass-card p-6 bg-gradient-to-r from-[#171717] to-[#251b17] border-l-4 border-[#F0441D]';
+          heroTitle.innerText = (d.membership.planName || '').toUpperCase();
+          heroDays.className = 'text-2xl font-black text-[#F0441D]';
+          heroExpiry.innerText = d.membership.remainingDays + ' days left';
+        } else {
+          heroCard.className = 'glass-card p-6 bg-gradient-to-r from-[#171717] to-[#1D1D1D] border-l-4 border-[#393939]';
+          heroTitle.innerText = 'NO ACTIVE MEMBERSHIP';
+          heroDays.className = 'text-2xl font-black text-[#858585]';
+          heroExpiry.innerText = 'No expiry';
+        }
       }
 
       // Attendance
-      document.getElementById('totalCheckInCount').innerText = d.attendance.totalCheckIns;
-      document.getElementById('todayAttendanceLabel').innerText = d.attendance.todayAttendance;
-      document.getElementById('monthlyAttendanceLabel').innerText = d.attendance.monthlyAttendancePercent + '%';
+      const totalCheckInsEl = document.getElementById('totalCheckInCount');
+      if (totalCheckInsEl) totalCheckInsEl.innerText = d.attendance.totalCheckIns;
+      const todayAttendanceEl = document.getElementById('todayAttendanceLabel');
+      if (todayAttendanceEl) todayAttendanceEl.innerText = d.attendance.todayAttendance;
+      const monthlyAttendanceEl = document.getElementById('monthlyAttendanceLabel');
+      if (monthlyAttendanceEl) monthlyAttendanceEl.innerText = d.attendance.monthlyAttendancePercent + '%';
 
       const gateStatus = document.getElementById('memberGateStatus');
-      if (d.attendance.todayAttendance > 0) {
-        gateStatus.className = 'inline-block px-2.5 py-0.5 rounded text-[10px] font-bold bg-[#F0441D]/20 text-[#F0441D] border border-[#F0441D]/30';
-        gateStatus.innerText = 'STATUS: IN GYM (CHECKED IN TODAY)';
-      } else if (d.membership.remainingDays > 0) {
-        gateStatus.className = 'inline-block px-2.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
-        gateStatus.innerText = 'STATUS: READY FOR CHECK-IN';
-      } else {
-        gateStatus.className = 'inline-block px-2.5 py-0.5 rounded text-[10px] font-bold bg-zinc-800 text-[#858585] border border-[#393939]';
-        gateStatus.innerText = 'STATUS: NO ACTIVE MEMBERSHIP';
+      if (gateStatus) {
+        if (d.attendance.todayAttendance > 0) {
+          gateStatus.className = 'inline-block px-2.5 py-0.5 rounded text-[10px] font-bold bg-[#F0441D]/20 text-[#F0441D] border border-[#F0441D]/30';
+          gateStatus.innerText = 'STATUS: IN GYM (CHECKED IN TODAY)';
+        } else if (d.membership.remainingDays > 0) {
+          gateStatus.className = 'inline-block px-2.5 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+          gateStatus.innerText = 'STATUS: READY FOR CHECK-IN';
+        } else {
+          gateStatus.className = 'inline-block px-2.5 py-0.5 rounded text-[10px] font-bold bg-zinc-800 text-[#858585] border border-[#393939]';
+          gateStatus.innerText = 'STATUS: NO ACTIVE MEMBERSHIP';
+        }
       }
 
       // Workout Snapshot & Screen
@@ -1518,29 +2078,113 @@ function renderWebApp() {
 
         // Leads
         const lBox = document.getElementById('admLeadsContainer');
-        lBox.innerHTML = d.leads.map(l => \`
-          <div class="p-3 bg-[#242424] rounded-xl flex justify-between items-center">
-            <div>
-              <strong class="text-white block">\${l.full_name}</strong>
-              <span class="text-[#858585]">\${l.phone} • Plan: \${l.interested_plan}</span>
-            </div>
-            <span class="text-[#F0441D] font-bold text-[10px] bg-[#F0441D]/10 px-2 py-0.5 rounded border border-[#F0441D]/30">\${l.status}</span>
-          </div>
-        \`).join('') || '<p class="text-[#858585]">No active leads.</p>';
+        lBox.innerHTML = (d.leads || []).map(l => {
+          const isConverted = l.status === 'CONVERTED';
+          return '<div class="p-3 bg-[#242424] rounded-xl flex justify-between items-center">' +
+            '<div>' +
+              '<strong class="text-white block">' + l.full_name + '</strong>' +
+              '<span class="text-[#858585]">' + (l.phone || '') + ' • Plan: ' + (l.interested_plan || 'General') + '</span>' +
+            '</div>' +
+            '<div class="flex items-center gap-1.5">' +
+              '<span class="text-[#F0441D] font-bold text-[10px] bg-[#F0441D]/10 px-2 py-0.5 rounded border border-[#F0441D]/30">' + l.status + '</span>' +
+              (!isConverted ? '<button data-id="' + l.id + '" data-status="' + l.status + '" onclick="apiAdvanceLead(this.dataset.id, this.dataset.status)" class="btn-orange text-[10px] px-2 py-0.5 font-bold">Advance</button>' : '<span class="text-emerald-400 text-[10px] font-bold">Active</span>') +
+            '</div>' +
+          '</div>';
+        }).join('') || '<p class="text-[#858585]">No active leads.</p>';
 
         // Inventory
         const iBox = document.getElementById('admInventoryContainer');
-        iBox.innerHTML = d.inventory.map(i => \`
-          <div class="p-3 bg-[#242424] rounded-xl flex justify-between items-center">
-            <div>
-              <strong class="text-white block">\${i.name}</strong>
-              <span class="text-[#858585]">Stock: \${i.current_stock} units • Retail: ₹\${i.selling_price}</span>
-            </div>
-            <span class="text-xs font-black text-white">₹\${i.selling_price}</span>
-          </div>
-        \`).join('') || '<p class="text-[#858585]">No inventory items recorded.</p>';
+        iBox.innerHTML = (d.inventory || []).map(i => {
+          const isLow = i.current_stock <= (i.min_stock_alert || 5);
+          return '<div class="p-3 bg-[#242424] rounded-xl flex justify-between items-center">' +
+            '<div>' +
+              '<strong class="text-white block">' + i.name + '</strong>' +
+              '<span class="text-[#858585]">SKU: ' + i.sku + ' • Stock: <span class="' + (isLow ? 'text-red-400 font-bold' : 'text-white font-bold') + '">' + i.current_stock + '</span> units ' + (isLow ? '<span class="bg-red-500/20 text-red-300 text-[10px] px-1.5 py-0.5 rounded font-bold ml-1">LOW STOCK</span>' : '') + '</span>' +
+            '</div>' +
+            '<div class="flex items-center gap-2">' +
+              '<span class="text-xs font-black text-white">₹' + i.selling_price + '</span>' +
+              '<button data-id="' + i.id + '" onclick="apiAdjustStock(this.dataset.id, 5)" class="btn-secondary text-[10px] px-2 py-1 font-bold">+5 Stock</button>' +
+            '</div>' +
+          '</div>';
+        }).join('') || '<p class="text-[#858585]">No inventory items recorded.</p>';
       } catch (err) {
         console.error('Admin dashboard error:', err);
+      }
+    }
+
+    // Reports Download
+    function downloadReport(type) {
+      window.open('/api/admin/reports/export?type=' + type, '_blank');
+    }
+
+    // Automations trigger
+    async function triggerAutomations() {
+      try {
+        const res = await apiRequest('/api/admin/automations/run-expiry-check', 'POST');
+        alert('Automations: ' + res.message + ' (Expired: ' + res.expiredCount + ')');
+        await fetchAdminDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    // Stock adjustments
+    async function apiAdjustStock(productId, qty) {
+      try {
+        await apiRequest('/api/admin/inventory/adjust', 'POST', { productId, changeQty: qty, reason: 'RESTOCK' });
+        await fetchAdminDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function apiAddInventory() {
+      const name = document.getElementById('invNameInput')?.value?.trim();
+      const sku = document.getElementById('invSkuInput')?.value?.trim();
+      const current_stock = document.getElementById('invStockInput')?.value;
+      const min_stock_alert = document.getElementById('invMinInput')?.value;
+      const cost_price = document.getElementById('invCostInput')?.value;
+      const selling_price = document.getElementById('invPriceInput')?.value;
+
+      if (!name) return alert('Product name is required');
+      try {
+        await apiRequest('/api/admin/inventory', 'POST', {
+          name, sku, current_stock, min_stock_alert, cost_price, selling_price
+        });
+        closeModal('addInventoryModal');
+        await fetchAdminDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function apiAddLead() {
+      const fullName = document.getElementById('leadNameInput')?.value?.trim();
+      const phone = document.getElementById('leadPhoneInput')?.value?.trim();
+      const email = document.getElementById('leadEmailInput')?.value?.trim();
+      const interestedPlan = document.getElementById('leadPlanInput')?.value;
+
+      if (!fullName || !phone) return alert('Prospect name and phone are required');
+      try {
+        await apiRequest('/api/admin/leads', 'POST', {
+          fullName, phone, email, interestedPlan, status: 'NEW'
+        });
+        closeModal('addLeadModal');
+        await fetchAdminDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function apiAdvanceLead(leadId, currentStage) {
+      const stages = ['NEW', 'CONTACTED', 'TRIAL', 'CONVERTED'];
+      const currentIdx = stages.indexOf(currentStage);
+      const nextStage = stages[Math.min(stages.length - 1, currentIdx + 1)];
+      try {
+        await apiRequest('/api/admin/leads/stage', 'POST', { leadId, stage: nextStage });
+        await fetchAdminDashboard();
+      } catch (e) {
+        alert(e.message);
       }
     }
 
@@ -1554,17 +2198,266 @@ function renderWebApp() {
         document.getElementById('supRevenue').innerText = '₹' + Number(d.metrics.platformRevenue).toLocaleString();
 
         const aBox = document.getElementById('supAuditLogsContainer');
-        aBox.innerHTML = d.recentAuditLogs.map(l => \`
-          <div class="p-3 bg-[#242424] rounded-xl flex justify-between items-center text-xs">
-            <div>
-              <strong class="text-white block">\${l.action}</strong>
-              <span class="text-[#858585]">Actor: \${l.actor_role} • Entity: \${l.entity} (\${l.entity_id || 'Global'})</span>
-            </div>
-            <span class="text-[#858585] text-[10px]">\${new Date(l.timestamp).toLocaleTimeString()}</span>
-          </div>
-        \`).join('') || '<p class="text-[#858585]">No audit logs recorded.</p>';
+        aBox.innerHTML = (d.recentAuditLogs || []).map(l => {
+          return '<div class="p-3 bg-[#242424] rounded-xl flex justify-between items-center text-xs">' +
+            '<div>' +
+              '<strong class="text-white block">' + l.action + '</strong>' +
+              '<span class="text-[#858585]">Actor: ' + l.actor_role + ' • Entity: ' + (l.entity || 'Global') + '</span>' +
+            '</div>' +
+            '<span class="text-[#858585] text-[10px]">' + (new Date(l.timestamp).toLocaleTimeString()) + '</span>' +
+          '</div>';
+        }).join('') || '<p class="text-[#858585]">No audit logs recorded.</p>';
       } catch (err) {
         console.error('Super admin error:', err);
+      }
+    }
+
+    // ---------------- TRAINER API CALLS ----------------
+    let trainerDashboardData = null;
+
+    async function fetchTrainerDashboard() {
+      try {
+        const d = await apiRequest('/api/trainer/dashboard');
+        trainerDashboardData = d;
+        if (d.trainer) {
+          const nameEl = document.getElementById('trainerPortalSub');
+          if (nameEl) nameEl.innerText = d.trainer.name + ' • ' + d.trainer.specialization;
+          document.getElementById('trainerActiveClients').innerText = d.trainer.activeClientsCount || d.trainees?.length || 0;
+          document.getElementById('trainerSessionsToday').innerText = d.trainer.sessionsTodayCount || d.schedule?.length || 0;
+          document.getElementById('trainerAdherenceRate').innerText = d.trainer.avgAdherenceRate || '93%';
+          document.getElementById('trainerActiveProtocols').innerText = d.trainees?.length || 4;
+        }
+
+        // Populate Trainees Table
+        const tbody = document.getElementById('trainerTraineesTableBody');
+        if (tbody) {
+          tbody.innerHTML = (d.trainees || []).map(t => {
+            return '<tr>' +
+              '<td class="py-2.5 font-bold text-white">' + t.fullName + '<span class="block text-[10px] text-[#858585]">' + t.email + '</span></td>' +
+              '<td><span class="text-[#B5B5B5]">' + t.targetGoal + '</span></td>' +
+              '<td><span class="text-white font-medium">' + t.workoutAssigned + '</span></td>' +
+              '<td><span class="text-[#858585]">' + t.dietAssigned + '</span></td>' +
+              '<td><span class="text-[#F0441D] font-bold">' + t.streak + 'd streak</span></td>' +
+              '<td><span class="text-emerald-400 font-bold">' + t.adherenceRate + '</span></td>' +
+              '<td>' +
+                '<button data-id="' + t.id + '" data-name="' + t.fullName + '" onclick="quickAssignRoutine(this.dataset.id, this.dataset.name)" class="btn-orange text-[10px] px-2 py-0.5 mr-1 font-bold">Routine</button>' +
+                '<button data-id="' + t.id + '" data-name="' + t.fullName + '" onclick="quickAssignMacro(this.dataset.id, this.dataset.name)" class="btn-secondary text-[10px] px-2 py-0.5 font-bold">Macros</button>' +
+              '</td>' +
+            '</tr>';
+          }).join('') || '<tr><td colspan="7" class="py-4 text-center">No assigned trainees.</td></tr>';
+        }
+
+        // Populate Schedule
+        const schedBox = document.getElementById('trainerScheduleContainer');
+        if (schedBox) {
+          schedBox.innerHTML = (d.schedule || []).map(s => {
+            return '<div class="p-3 bg-[#242424] rounded-xl flex justify-between items-center">' +
+              '<div>' +
+                '<div class="flex items-center space-x-2">' +
+                  '<strong class="text-white text-xs">' + s.time + '</strong>' +
+                  '<span class="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold">' + s.room + '</span>' +
+                '</div>' +
+                '<span class="text-[#B5B5B5] block text-[11px] mt-0.5">' + s.type + ' • <span class="text-white font-semibold">' + s.traineeName + '</span></span>' +
+              '</div>' +
+              '<span class="text-emerald-400 font-bold text-[10px] bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">' + s.status + '</span>' +
+            '</div>';
+          }).join('') || '<p class="text-[#858585]">No sessions scheduled today.</p>';
+        }
+
+        // Populate Feedback Notes
+        const fbBox = document.getElementById('trainerFeedbackContainer');
+        if (fbBox) {
+          fbBox.innerHTML = (d.feedbackNotes || []).map(f => {
+            return '<div class="p-3 bg-[#242424] rounded-xl space-y-1">' +
+              '<div class="flex justify-between items-center">' +
+                '<strong class="text-white text-xs">' + f.traineeName + '</strong>' +
+                '<span class="text-[#858585] text-[10px]">' + f.date + '</span>' +
+              '</div>' +
+              '<p class="text-[#B5B5B5] text-[11px]">' + f.note + '</p>' +
+              '<div class="text-[#F0441D] text-[10px] font-bold">Rating: ' + '★'.repeat(f.rating || 5) + '</div>' +
+            '</div>';
+          }).join('') || '<p class="text-[#858585]">No feedback logged.</p>';
+        }
+
+        // Populate selectors
+        updateTrainerAthleteSelects(d.trainees || []);
+      } catch (err) {
+        console.error('Trainer dashboard error:', err);
+      }
+    }
+
+    function updateTrainerAthleteSelects(trainees) {
+      const selects = ['routineAthleteSelect', 'macroAthleteSelect', 'noteAthleteSelect'];
+      selects.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+          el.innerHTML = trainees.map(t => '<option value="' + t.id + '">' + t.fullName + ' (' + t.planName + ')</option>').join('');
+        }
+      });
+    }
+
+    function quickAssignRoutine(id, name) {
+      const el = document.getElementById('routineAthleteSelect');
+      if (el) el.value = id;
+      openModal('assignRoutineModal');
+    }
+
+    function quickAssignMacro(id, name) {
+      const el = document.getElementById('macroAthleteSelect');
+      if (el) el.value = id;
+      openModal('assignMacroModal');
+    }
+
+    async function apiTrainerAssignWorkout() {
+      const memberId = document.getElementById('routineAthleteSelect')?.value;
+      const title = document.getElementById('routineTitleInput')?.value?.trim() || 'Pro Routine';
+      const ex1 = document.getElementById('routineEx1Name')?.value?.trim();
+      const ex2 = document.getElementById('routineEx2Name')?.value?.trim();
+      if (!memberId) return alert('Select an athlete');
+
+      const workout = {
+        title,
+        trainer_name: currentUser?.fullName || 'Coach Rahul',
+        exercises: [
+          { name: ex1 || 'Barbell Bench Press', sets: 4, reps: '8-10', weight_kg: Number(document.getElementById('routineEx1Weight')?.value || 80), completed: false },
+          { name: ex2 || 'Incline DB Press', sets: 3, reps: '10-12', weight_kg: Number(document.getElementById('routineEx2Weight')?.value || 28), completed: false }
+        ]
+      };
+
+      try {
+        await apiRequest('/api/trainer/assign-workout', 'POST', { memberId, workout });
+        closeModal('assignRoutineModal');
+        alert('Routine assigned to athlete.');
+        await fetchTrainerDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function apiTrainerAssignDiet() {
+      const memberId = document.getElementById('macroAthleteSelect')?.value;
+      const calories = Number(document.getElementById('macroCalsInput')?.value || 2600);
+      const protein = Number(document.getElementById('macroProteinInput')?.value || 180);
+      const carbs = Number(document.getElementById('macroCarbsInput')?.value || 280);
+      const fat = Number(document.getElementById('macroFatInput')?.value || 65);
+      const water = Number(document.getElementById('macroWaterInput')?.value || 3500);
+      if (!memberId) return alert('Select an athlete');
+
+      const diet = {
+        target_calories: calories,
+        target_protein_g: protein,
+        target_carbs_g: carbs,
+        target_fat_g: fat,
+        water_target_ml: water,
+        water_consumed_ml: 1000
+      };
+
+      try {
+        await apiRequest('/api/trainer/assign-diet', 'POST', { memberId, diet });
+        closeModal('assignMacroModal');
+        alert('Macro nutrition protocol prescribed.');
+        await fetchTrainerDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function apiTrainerAddFeedback() {
+      const select = document.getElementById('noteAthleteSelect');
+      const memberId = select?.value;
+      const traineeName = select?.options[select.selectedIndex]?.text?.split(' (')[0] || 'Athlete';
+      const note = document.getElementById('coachingNoteText')?.value?.trim();
+      const rating = document.getElementById('coachingNoteRating')?.value || 5;
+      if (!note) return alert('Please enter coaching feedback text.');
+
+      try {
+        await apiRequest('/api/trainer/feedback', 'POST', { memberId, traineeName, note, rating });
+        closeModal('addCoachingNoteModal');
+        document.getElementById('coachingNoteText').value = '';
+        alert('Feedback note saved.');
+        await fetchTrainerDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    // ---------------- STOCK MOVEMENTS & INVENTORY ----------------
+    function openStockMovementModal() {
+      openModal('stockMovementModal');
+    }
+
+    async function apiRecordStockMovement() {
+      const productId = document.getElementById('stockMoveProductSelect')?.value;
+      const type = document.getElementById('stockMoveTypeSelect')?.value;
+      const qtyChange = Number(document.getElementById('stockMoveQtyInput')?.value || 1);
+      const reason = document.getElementById('stockMoveReasonInput')?.value?.trim();
+      if (!productId) return alert('Select a product.');
+
+      try {
+        const res = await apiRequest('/api/admin/inventory/movement', 'POST', { productId, type, qtyChange, reason });
+        closeModal('stockMovementModal');
+        alert('Stock movement recorded. New Balance: ' + res.product.current_stock);
+        await fetchAdminDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    // ---------------- CRM FOLLOW-UPS ----------------
+    function openFollowUpLeadModal(leadId, currentStage) {
+      document.getElementById('followUpLeadId').value = leadId;
+      if (currentStage) document.getElementById('followUpStageSelect').value = currentStage;
+      openModal('leadFollowUpModal');
+    }
+
+    async function apiSubmitLeadFollowUp() {
+      const leadId = document.getElementById('followUpLeadId')?.value;
+      const status = document.getElementById('followUpStageSelect')?.value;
+      const followUpDate = document.getElementById('followUpDateInput')?.value;
+      const notes = document.getElementById('followUpNotesInput')?.value?.trim();
+      if (!leadId) return alert('Invalid lead');
+
+      try {
+        await apiRequest('/api/admin/leads/follow-up', 'POST', { leadId, status, followUpDate, notes, staff: currentUser?.fullName || 'Admin' });
+        closeModal('leadFollowUpModal');
+        alert('Lead status updated.');
+        await fetchAdminDashboard();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    // ---------------- REPORTS & PRINT VIEW ----------------
+    async function printReport(type = 'revenue') {
+      try {
+        const res = await apiRequest('/api/admin/reports?dateRange=All+Time');
+        const d = res.detailed || res;
+        const box = document.getElementById('reportsPrintContent');
+        if (box) {
+          box.innerHTML = '<div class="space-y-4">' +
+            '<div class="grid grid-cols-2 sm:grid-cols-4 gap-3">' +
+              '<div class="p-3 bg-[#242424] rounded-lg"><span class="text-[#858585] block text-[10px]">TOTAL REVENUE</span><span class="text-lg font-bold text-white">₹' + Number(d.summary?.totalRevenue || 0).toLocaleString() + '</span></div>' +
+              '<div class="p-3 bg-[#242424] rounded-lg"><span class="text-[#858585] block text-[10px]">TOTAL EXPENSES</span><span class="text-lg font-bold text-white">₹' + Number(d.summary?.totalExpenses || 0).toLocaleString() + '</span></div>' +
+              '<div class="p-3 bg-[#242424] rounded-lg"><span class="text-[#858585] block text-[10px]">NET PROFIT</span><span class="text-lg font-bold text-emerald-400">₹' + Number(d.summary?.netProfit || 0).toLocaleString() + '</span></div>' +
+              '<div class="p-3 bg-[#242424] rounded-lg"><span class="text-[#858585] block text-[10px]">OPERATING MARGIN</span><span class="text-lg font-bold text-white">' + (d.summary?.profitMargin || '0%') + '</span></div>' +
+            '</div>' +
+            '<div class="mt-4"><strong class="text-white block mb-2">MEMBERSHIP SALES BREAKDOWN</strong>' +
+              '<table class="w-full text-left text-xs divide-y divide-[#393939]"><thead class="text-[#858585]"><tr><th>Tier</th><th>Units</th><th>Revenue</th></tr></thead>' +
+              '<tbody class="divide-y divide-[#2c2c2c] text-[#B5B5B5]">' +
+                (d.membershipSales || []).map(m => '<tr><td class="py-1.5">' + m.tier + '</td><td>' + m.unitsSold + '</td><td class="text-white font-bold">₹' + Number(m.revenue).toLocaleString() + '</td></tr>').join('') +
+              '</tbody></table>' +
+            '</div>' +
+            '<div class="mt-4"><strong class="text-white block mb-2">ATTENDANCE PEAK DISTRIBUTION</strong>' +
+              '<table class="w-full text-left text-xs divide-y divide-[#393939]"><thead class="text-[#858585]"><tr><th>Time Window</th><th>Period</th><th>Avg Check-ins</th></tr></thead>' +
+              '<tbody class="divide-y divide-[#2c2c2c] text-[#B5B5B5]">' +
+                (d.attendanceBreakdown || []).map(a => '<tr><td class="py-1.5">' + a.timeSlot + '</td><td>' + a.peakLabel + '</td><td class="text-white font-bold">' + a.avgCheckins + ' athletes</td></tr>').join('') +
+              '</tbody></table>' +
+            '</div>' +
+          '</div>';
+        }
+        openModal('reportsPrintModal');
+      } catch (e) {
+        alert(e.message);
       }
     }
 
@@ -1575,33 +2468,24 @@ function renderWebApp() {
       if (!text) return;
 
       const box = document.getElementById('aiChatBox');
-      box.innerHTML += \`
-        <div class="flex items-start justify-end space-x-2">
-          <div class="bg-[#F0441D]/20 border border-[#F0441D]/40 p-2.5 rounded-xl max-w-[85%] text-white">
-            \${text}
-          </div>
-        </div>
-      \`;
+      box.innerHTML += '<div class="flex items-start justify-end space-x-2">' +
+        '<div class="bg-[#F0441D]/20 border border-[#F0441D]/40 p-2.5 rounded-xl max-w-[85%] text-white">' + text + '</div>' +
+      '</div>';
       input.value = '';
       box.scrollTop = box.scrollHeight;
 
       try {
         const res = await apiRequest('/api/ai-assistant', 'POST', {
           question: text,
-          member: currentUser,
           language: currentLang
         });
 
-        box.innerHTML += \`
-          <div class="flex items-start space-x-2">
-            <div class="bg-[#242424] p-3 rounded-xl max-w-[85%] text-white">
-              \${res.answer}
-            </div>
-          </div>
-        \`;
+        box.innerHTML += '<div class="flex items-start space-x-2">' +
+          '<div class="bg-[#242424] p-3 rounded-xl max-w-[85%] text-white">' + res.answer + '</div>' +
+        '</div>';
         box.scrollTop = box.scrollHeight;
       } catch (err) {
-        box.innerHTML += \`<div class="text-red-400 text-xs">Coach is offline temporarily.</div>\`;
+        box.innerHTML += '<div class="text-red-400 text-xs">Coach is offline temporarily.</div>';
       }
     }
 
@@ -1610,20 +2494,85 @@ function renderWebApp() {
       document.getElementById('langBtnText').innerText = currentLang === 'en' ? 'हिन्दी' : 'EN';
     }
 
+    // PWA Install & Offline Management
+    let deferredPwaPrompt = null;
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredPwaPrompt = e;
+      const btn = document.getElementById('pwaInstallBtn');
+      if (btn) btn.classList.remove('hidden');
+    });
+
+    window.addEventListener('appinstalled', () => {
+      deferredPwaPrompt = null;
+      const btn = document.getElementById('pwaInstallBtn');
+      if (btn) btn.classList.add('hidden');
+    });
+
+    function installPWA() {
+      const isIOS = /iphone|ipad|ipod/.test(window.navigator.userAgent.toLowerCase());
+      if (isIOS) {
+        openModal('pwaIosModal');
+        return;
+      }
+      if (deferredPwaPrompt) {
+        deferredPwaPrompt.prompt();
+        deferredPwaPrompt.userChoice.then(() => {
+          deferredPwaPrompt = null;
+          const btn = document.getElementById('pwaInstallBtn');
+          if (btn) btn.classList.add('hidden');
+        });
+      }
+    }
+
+    function updateOnlineStatus() {
+      const banner = document.getElementById('offlineBanner');
+      if (banner) {
+        banner.classList.toggle('hidden', navigator.onLine);
+      }
+    }
+    window.addEventListener('online', updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+
     // App Initialization
     async function initApp() {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').catch(err => {
+          console.warn('[PWA] ServiceWorker notice:', err);
+        });
+      }
+
+      const path = (window.location && window.location.pathname ? window.location.pathname : '').toLowerCase();
+
       if (authToken) {
         try {
           const res = await apiRequest('/api/auth/me');
           currentUser = res.user;
-          quickSwitchRole(currentUser.role);
+
+          // Route enforcement for dedicated URLs
+          if (path.includes('trainer') && currentUser.role !== 'TRAINER' && currentUser.role !== 'SUPER_ADMIN') {
+            console.warn('Redirecting unauthorized user from trainer portal');
+            await routeUserToDashboard(currentUser.role);
+            return;
+          }
+
+          await routeUserToDashboard(currentUser.role);
           return;
         } catch (e) {
           localStorage.removeItem('fithub_auth_token');
           authToken = null;
         }
       }
-      navigateTo('role_select');
+
+      // Unauthenticated state
+      setAuthMode('signin');
+      if (path === '/login/trainer' || path === '/dashboard/trainer') {
+        const titleEl = document.getElementById('loginPageTitle');
+        if (titleEl) titleEl.innerText = 'TRAINER PORTAL';
+        const subtitleEl = document.getElementById('loginSubtitle');
+        if (subtitleEl) subtitleEl.innerText = 'Sign in with your trainer credentials';
+      }
+      navigateTo('login');
     }
 
     initApp();
