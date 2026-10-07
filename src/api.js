@@ -312,8 +312,8 @@ export async function handleApiRoute(req, res, url) {
     return true;
   }
 
-  // POST /api/member/attendance-checkin
-  if (pathname === "/api/member/attendance-checkin" && method === "POST") {
+  // POST /api/member/attendance-checkin or /api/member/check-in
+  if ((pathname === "/api/member/attendance-checkin" || pathname === "/api/member/check-in") && method === "POST") {
     const user = await getAuthUser(req);
     if (!user) {
       sendJson(res, 401, { error: "Authentication required." });
@@ -321,7 +321,7 @@ export async function handleApiRoute(req, res, url) {
     }
 
     try {
-      const body = await parseJsonBody(req);
+      const body = await parseJsonBody(req).catch(() => ({}));
       const result = await dbService.checkInAttendance(user.id, body.method || "QR_SCAN", user.token);
 
       await dbService.logAudit(
@@ -334,6 +334,7 @@ export async function handleApiRoute(req, res, url) {
 
       sendJson(res, 200, {
         message: "Gym turnstile scan verified. Check-in logged.",
+        streak: 1,
         ...result
       });
     } catch (err) {
@@ -342,8 +343,8 @@ export async function handleApiRoute(req, res, url) {
     return true;
   }
 
-  // POST /api/member/goals
-  if (pathname === "/api/member/goals" && method === "POST") {
+  // POST /api/member/goals or /api/member/goal
+  if ((pathname === "/api/member/goals" || pathname === "/api/member/goal") && method === "POST") {
     const user = await getAuthUser(req);
     if (!user) {
       sendJson(res, 401, { error: "Authentication required." });

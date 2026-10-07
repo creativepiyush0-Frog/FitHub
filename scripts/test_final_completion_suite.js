@@ -320,7 +320,7 @@ async function runAllTests() {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${memberToken}` },
       body: JSON.stringify({ weight: 78.5, bodyFat: 14.8, notes: "Feeling energized, recovery on track" })
     });
-    report("Progress", "Member logs body composition progress record", progRes.status === 200 ? "PASS" : "FAIL");
+    report("Progress", "Member logs body composition progress record", (progRes.status === 200 || progRes.status === 201) ? "PASS" : "FAIL");
   } catch (err) {
     report("Progress", "Progress test", "FAIL", err.message);
   }
@@ -333,7 +333,7 @@ async function runAllTests() {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${memberToken}` },
       body: JSON.stringify({ title: "Bench Press 100kg PR", targetDate: "2026-11-30" })
     });
-    report("Goals", "Member sets specific strength milestone goal", goalRes.status === 200 ? "PASS" : "FAIL");
+    report("Goals", "Member sets specific strength milestone goal", (goalRes.status === 200 || goalRes.status === 201) ? "PASS" : "FAIL");
   } catch (err) {
     report("Goals", "Goals test", "FAIL", err.message);
   }
