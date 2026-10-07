@@ -2,6 +2,7 @@ import http from "node:http";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { GoogleGenAI } from "@google/genai";
 import { handleApiRoute, sendJson, parseJsonBody, getAuthUser } from "./src/api.js";
 import { dbService } from "./src/db.js";
 
@@ -9,31 +10,106 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = process.env.DEFAULT_APP_PORT || process.env.PORT || 3000;
 
-// Gemini API integration on the server side
-async function callGeminiApi(prompt, systemInstruction) {
+// Gemini API integration on the server side using @google/genai SDK
+let geminiClient = null;
+function getGeminiClient() {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  if (!geminiClient) {
+    geminiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+        timeout: 12000,
+      },
+    });
+  }
+  return geminiClient;
+}
+
+// Server-side Gemini API caller with Gemini 3.8 Flash preferred and free-tier fallback
+async function callGeminiApi(prompt, systemInstruction, language = "en") {
+  const isHi = language === "hi";
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return "FIT HUB AI Coach is active. (Connect GEMINI_API_KEY in environment for live model responses). Focus on high protein intake, progressive overload in compound lifts, and 7-8 hours of sleep.";
+    return {
+      success: false,
+      errorType: "MISSING_KEY",
+      answer: isHi
+        ? "AI फिटनेस कोच अभी कॉन्फ़िगर नहीं है। कृपया सर्वर में GEMINI_API_KEY सेट करें।"
+        : "AI Fitness Coach is not configured yet. Please set GEMINI_API_KEY in your server environment.",
+    };
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-  const payload = {
-    contents: [{ parts: [{ text: prompt }] }],
-    systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction }] } : undefined,
+  const ai = getGeminiClient();
+  if (!ai) {
+    return {
+      success: false,
+      errorType: "CLIENT_ERROR",
+      answer: isHi
+        ? "AI Coach अभी उपलब्ध नहीं है। कृपया थोड़ी देर बाद फिर कोशिश करें।"
+        : "AI Coach is temporarily unavailable. Please try again later.",
+    };
+  }
+
+  // Preferred model: gemini-3.8-flash, with automatic fallback to gemini-3.5-flash / gemini-3.1-flash-lite on 503/high-demand/timeout
+  const candidateModels = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"];
+
+  for (const model of candidateModels) {
+    try {
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            temperature: 0.7,
+            maxOutputTokens: 600,
+          },
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 7000))
+      ]);
+
+      const text = response.text;
+      if (text && text.trim()) {
+        return {
+          success: true,
+          model,
+          answer: text.trim(),
+        };
+      }
+    } catch (err) {
+      console.warn(`[Gemini API] Call with ${model} failed:`, err?.status || err?.message || err);
+      const errMsg = String(err?.message || err || "").toLowerCase();
+
+      // Check for rate limit / quota
+      if (err?.status === 429 || errMsg.includes("429") || errMsg.includes("resource_exhausted") || errMsg.includes("quota")) {
+        return {
+          success: false,
+          errorType: "RATE_LIMIT",
+          answer: isHi
+            ? "AI कोच की सीमा समाप्त हो गई है। कृपया थोड़ी देर बाद फिर कोशिश करें।"
+            : "AI Coach usage limit reached. Please wait a moment and try again.",
+        };
+      }
+
+      // If temporary 503 unavailable or timeout, try next fallback model
+      if (err?.status === 503 || errMsg.includes("503") || errMsg.includes("unavailable") || errMsg.includes("timeout")) {
+        continue;
+      }
+    }
+  }
+
+  // Friendly error message for all other failures
+  return {
+    success: false,
+    errorType: "API_ERROR",
+    answer: isHi
+      ? "AI Coach अभी उपलब्ध नहीं है। कृपया थोड़ी देर बाद फिर कोशिश करें।"
+      : "AI Coach is temporarily unavailable. Please try again later.",
   };
-
-  try {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await res.json();
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || "Keep pushing your limits! Stay consistent with your nutrition and training.";
-  } catch (err) {
-    console.error("Gemini API call failed:", err);
-    return "Error communicating with AI service. Focus on form and progressive overload.";
-  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -84,28 +160,110 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       try {
-        const { question, language } = await parseJsonBody(req);
-        // Only load the authenticated member's authorized profile, plan, streak, and goals
+        const { question, language = "en" } = await parseJsonBody(req);
+        if (!question || typeof question !== "string" || !question.trim()) {
+          sendJson(res, 400, { error: "Question is required." });
+          return;
+        }
+
+        // Only load the authenticated member's authorized records
         const memberData = await dbService.getMemberDashboard(user.id, user.token);
         const athleteName = user.fullName || "Athlete";
-        const plan = memberData.planName || "No active membership";
+        const email = user.email || "";
+        const planName = memberData.planName || "No active membership";
+        const status = memberData.status || "INACTIVE";
+        const remainingDays = typeof memberData.remainingDays === "number" ? memberData.remainingDays : 0;
+        const expiryDate = memberData.expiryDate || "No expiry";
         const streak = memberData.streak || 0;
-        const goalsStr = (memberData.goals || []).map(g => `${g.goal_type || 'Milestone'}: ${g.target_value}`).join(", ") || "General strength & fitness";
+        const totalCheckins = memberData.attendanceCount || 0;
+        const todayAttended = memberData.todayAttended ? "Yes" : "No";
+        const monthlyPercent = memberData.monthlyPercent || "0%";
+
+        // Workouts
+        let workoutsStr = "NONE (No workout routine has been assigned to this athlete yet)";
+        if (memberData.workouts && memberData.workouts.length > 0) {
+          workoutsStr = memberData.workouts.map(w => {
+            const exStr = (w.exercises || []).map(e => `${e.name} (${e.sets} sets x ${e.reps} reps, ${e.weight_kg || 0}kg, completed: ${e.completed ? 'YES' : 'NO'})`).join(", ");
+            return `${w.title || 'Workout'}: ${exStr || 'No exercises'}`;
+          }).join("; ");
+        }
+
+        // Diet
+        let dietStr = "NONE (No diet or nutrition protocol prescribed yet)";
+        if (memberData.diet) {
+          const d = memberData.diet;
+          dietStr = `Daily Targets: ${d.target_calories || 0} kcal, Protein: ${d.target_protein_g || 0}g, Carbs: ${d.target_carbs_g || 0}g, Fats: ${d.target_fat_g || 0}g. Water Consumed: ${d.water_consumed_ml || 0} ml / ${d.water_target_ml || 3000} ml. ${d.guidelines ? `Guidelines: ${d.guidelines}` : ''}`;
+        }
+
+        // Goals
+        let goalsStr = "NONE (No fitness goals set yet)";
+        if (memberData.goals && memberData.goals.length > 0) {
+          goalsStr = memberData.goals.map(g => `${g.title || g.goal_type || 'Goal'}: Target ${g.target_value || ''} (Target Date: ${g.target_date || g.deadline || 'Ongoing'})`).join("; ");
+        }
+
+        // Progress
+        let progressStr = "NONE (No body composition records logged yet)";
+        if (memberData.progress && memberData.progress.length > 0) {
+          const latest = memberData.progress[memberData.progress.length - 1];
+          progressStr = `Latest Record (${latest.date || latest.recorded_at || 'Recent'}): Weight: ${latest.weight_kg || 'N/A'} kg, Calculated BMI: ${latest.bmi || 'N/A'}`;
+        }
+
+        // Bookings
+        let bookingsStr = "NONE (No group class or studio bookings yet)";
+        if (memberData.bookings && memberData.bookings.length > 0) {
+          bookingsStr = memberData.bookings.map(b => `${b.class_title || 'Class'} (${b.schedule || b.booked_at || 'Scheduled'}, Status: ${b.booking_status || 'CONFIRMED'})`).join("; ");
+        }
+
+        const langDirective = (language === "hi") ? "Hindi (हिन्दी)" : "English";
 
         const sysInstruction = `You are FIT HUB's elite AI Fitness Coach.
-Authorized Athlete Profile:
+AUTHENTICATED ATHLETE FIT HUB PROFILE:
 - Name: ${athleteName}
-- Plan: ${plan} (${memberData.status})
-- Attendance Streak: ${streak} days
-- Active Goals: ${goalsStr}
+- Email: ${email}
+- Membership: ${planName} (${status})
+- Remaining Days: ${remainingDays} days (Expiry: ${expiryDate})
+- Attendance: Current Streak: ${streak} days, Total Check-ins: ${totalCheckins}, Checked in today: ${todayAttended}, Monthly Attendance: ${monthlyPercent}
+- Assigned Workout Routine: ${workoutsStr}
+- Prescribed Diet & Macros: ${dietStr}
+- Active Fitness Goals: ${goalsStr}
+- Body Composition Progress: ${progressStr}
+- Class Bookings: ${bookingsStr}
 
-CRITICAL SECURITY RULE: You only have access to, and may only discuss, this authenticated athlete's own training, diet, and fitness metrics. Never access, discuss, or leak other gym members or administrative data.
-Provide concise, motivational, actionable coaching in ${language === "hi" ? "Hindi (हिन्दी)" : "English"}.`;
+CRITICAL RULES:
+1. DATA INTEGRITY & GROUNDING:
+Distinguish strictly between the user's actual FitHub data above and general fitness concepts.
+When the athlete asks about their personal data (such as today's workout, membership status/days left, attendance/streak, goals, diet/nutrition, progress, or booked classes):
+- ONLY use the actual data listed above.
+- If data is missing (e.g. Assigned Workout Routine is NONE, Prescribed Diet is NONE, Class Bookings is NONE, Active Goals is NONE, Progress is NONE):
+  State clearly in ${langDirective}:
+  English: "No workout has been assigned to you yet." / "No diet plan has been assigned to you yet." / "You currently have no class bookings." / "No goals have been set yet."
+  Hindi: "अभी आपको कोई वर्कआउट असाइन नहीं किया गया है।" / "अभी आपको कोई डाइट प्लान असाइन नहीं किया गया है।" / "वर्तमान में आपकी कोई क्लास बुकिंग नहीं है।" / "अभी कोई गोल सेट नहीं किया गया है।"
+- NEVER hallucinate, invent, or assume any fake workouts, exercises, attendance dates, weights, or membership details.
 
-        const answer = await callGeminiApi(question, sysInstruction);
-        sendJson(res, 200, { answer });
+2. PRIVACY & TENANT ISOLATION:
+You strictly ONLY have access to this authenticated athlete's own training and health data. You have NO access to other members, trainers, staff, or administrative financial data. If the user asks about other gym members, trainers, admin financials, or another member's profile/attendance, refuse politely and state that you can only access their personal records.
+
+3. SAFETY & MEDICAL BOUNDARIES:
+You are an encouraging fitness assistant, NOT a doctor or medical professional.
+- Do not diagnose injuries or medical conditions.
+- Do not recommend dangerous exercises, extreme starvation, unsafe weight cutting, or harmful supplements.
+- For injuries, severe pain, or medical concerns, advise consulting a qualified doctor or healthcare specialist.
+
+4. LANGUAGE:
+Respond naturally, fluently, and appropriately in ${langDirective}. If the prompt is in Hindi or language is 'hi', reply in clean, natural Hindi. If English, reply in English.
+
+5. CONCISENESS & FREE-TIER EFFICIENCY:
+Provide crisp, direct, motivational coaching without unnecessary filler (keep under 150 words).`;
+
+        const result = await callGeminiApi(question, sysInstruction, language);
+        sendJson(res, 200, { answer: result.answer, success: result.success });
       } catch (err) {
-        sendJson(res, 500, { error: err.message });
+        console.error("[AI Assistant Error]", err);
+        const isHi = language === "hi";
+        sendJson(res, 500, {
+          error: isHi ? "AI Coach अभी उपलब्ध नहीं है। कृपया थोड़ी देर बाद फिर कोशिश करें।" : "AI Coach is temporarily unavailable. Please try again later.",
+          answer: isHi ? "AI Coach अभी उपलब्ध नहीं है। कृपया थोड़ी देर बाद फिर कोशिश करें।" : "AI Coach is temporarily unavailable. Please try again later."
+        });
       }
       return;
     }
@@ -276,9 +434,61 @@ function renderWebApp() {
       background-color: #F0441D;
       color: #FFFFFF !important;
     }
+    /* Splash Screen Styles */
+    #splashScreen {
+      position: fixed;
+      inset: 0;
+      z-index: 99999;
+      background: radial-gradient(circle at 50% 50%, #171717 0%, #0A0A0A 60%, #050505 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 3rem 1.5rem 2.5rem;
+      transition: opacity 0.5s cubic-bezier(0.4, 0, 0.2, 1), visibility 0.5s;
+    }
+    #splashScreen.fade-out {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
+    }
+    .splash-pulse-glow {
+      animation: splashPulse 2s ease-in-out infinite;
+    }
+    @keyframes splashPulse {
+      0%, 100% { transform: scale(1); filter: drop-shadow(0 0 15px rgba(240, 68, 29, 0.35)); }
+      50% { transform: scale(1.03); filter: drop-shadow(0 0 30px rgba(240, 68, 29, 0.65)); }
+    }
   </style>
 </head>
 <body class="min-h-screen flex flex-col justify-between">
+
+  <!-- Production App Splash Screen Matching Provided Design -->
+  <div id="splashScreen">
+    <div class="w-full flex-1 flex flex-col items-center justify-center relative">
+      <!-- Background subtle pulse curve -->
+      <div class="absolute inset-0 flex items-center justify-center pointer-events-none opacity-20">
+        <svg viewBox="0 0 800 400" class="w-full max-w-lg">
+          <path d="M 50 200 L 250 200 L 280 150 L 320 280 L 360 80 L 400 320 L 440 170 L 470 220 L 510 190 L 750 190" 
+                fill="none" stroke="#F0441D" stroke-width="3" stroke-linecap="round"/>
+        </svg>
+      </div>
+
+      <!-- Centered FitHub Logo Icon and Typography -->
+      <div class="text-center z-10 flex flex-col items-center splash-pulse-glow">
+        <img src="/icon.svg" alt="FitHub Logo" class="w-32 h-32 sm:w-40 sm:h-40 rounded-[28px] shadow-2xl mb-4 border border-[#2a2a2a]">
+        <div class="fithub-heading text-5xl sm:text-6xl tracking-tight leading-none">
+          <span class="text-[#F0441D]">FIT</span> <span class="text-white">HUB</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bottom Version & Tagline Exactly Matching Provided Splash Screen -->
+    <div class="text-center z-10 space-y-1">
+      <p class="text-xs sm:text-sm font-medium text-[#E5E5E5] tracking-wider">v1.0.0 | Total Fitness, Redefined.</p>
+      <p class="text-[11px] text-[#757575] font-normal tracking-wide">Your Total Fitness Partner</p>
+    </div>
+  </div>
 
   <!-- Mobile App Frame Container -->
   <div class="w-full max-w-5xl mx-auto min-h-screen flex flex-col p-3 sm:p-5">
@@ -299,10 +509,11 @@ function renderWebApp() {
           <span id="headerNotifDot" class="hidden absolute top-1.5 right-1.5 w-2 h-2 rounded-full bg-[#F0441D]"></span>
         </button>
 
-        <!-- Language Button -->
-        <button onclick="toggleLang()" class="px-2.5 py-1 rounded-xl bg-[#171717] border border-[#393939] text-xs font-bold text-[#B5B5B5] hover:text-white">
-          <span id="langBtnText">हिन्दी</span>
-        </button>
+        <!-- Language Switcher: EN | HI -->
+        <div class="flex items-center rounded-xl bg-[#171717] border border-[#393939] p-0.5 text-xs font-bold" id="langSelector">
+          <button id="langBtnEn" onclick="setLanguage('en')" class="px-2.5 py-1 rounded-lg transition text-white bg-[#F0441D]">EN</button>
+          <button id="langBtnHi" onclick="setLanguage('hi')" class="px-2.5 py-1 rounded-lg transition text-[#858585] hover:text-white">HI</button>
+        </div>
 
         <!-- Install PWA Button -->
         <button id="pwaInstallBtn" onclick="installPWA()" class="hidden px-2.5 py-1 rounded-xl bg-[#F0441D] text-white text-xs font-bold hover:bg-[#FF542B] transition flex items-center gap-1.5 shadow-md">
@@ -463,15 +674,15 @@ function renderWebApp() {
 
         <!-- Nav Tabs for Member -->
         <div class="flex overflow-x-auto space-x-2 border-b border-[#393939] pb-2 text-xs font-semibold">
-          <button onclick="setMemberTab('overview')" id="mTab-overview" class="px-3.5 py-1.5 rounded-lg active-nav-pill whitespace-nowrap">Dashboard</button>
-          <button onclick="setMemberTab('workout')" id="mTab-workout" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Workout</button>
-          <button onclick="setMemberTab('diet')" id="mTab-diet" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Diet</button>
-          <button onclick="setMemberTab('progress')" id="mTab-progress" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Progress & BMI</button>
-          <button onclick="setMemberTab('goals')" id="mTab-goals" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Goals</button>
-          <button onclick="setMemberTab('qr')" id="mTab-qr" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">QR Pass</button>
-          <button onclick="setMemberTab('classes')" id="mTab-classes" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Classes & Billing</button>
-          <button onclick="setMemberTab('aicoach')" id="mTab-aicoach" class="px-3.5 py-1.5 rounded-lg text-[#F0441D] font-bold hover:text-white whitespace-nowrap">🤖 AI Coach</button>
-          <button onclick="setMemberTab('support')" id="mTab-support" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Support</button>
+          <button onclick="setMemberTab('overview')" id="mTab-overview" data-i18n="tab_overview" class="px-3.5 py-1.5 rounded-lg active-nav-pill whitespace-nowrap">Dashboard</button>
+          <button onclick="setMemberTab('workout')" id="mTab-workout" data-i18n="tab_workout" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Workout</button>
+          <button onclick="setMemberTab('diet')" id="mTab-diet" data-i18n="tab_diet" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Diet</button>
+          <button onclick="setMemberTab('progress')" id="mTab-progress" data-i18n="tab_progress" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Progress & BMI</button>
+          <button onclick="setMemberTab('goals')" id="mTab-goals" data-i18n="tab_goals" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Goals</button>
+          <button onclick="setMemberTab('qr')" id="mTab-qr" data-i18n="tab_qr" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">QR Pass</button>
+          <button onclick="setMemberTab('classes')" id="mTab-classes" data-i18n="tab_classes" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Classes & Billing</button>
+          <button onclick="setMemberTab('aicoach')" id="mTab-aicoach" data-i18n="tab_aicoach" class="px-3.5 py-1.5 rounded-lg text-[#F0441D] font-bold hover:text-white whitespace-nowrap">🤖 AI Coach</button>
+          <button onclick="setMemberTab('support')" id="mTab-support" data-i18n="tab_support" class="px-3.5 py-1.5 rounded-lg text-[#B5B5B5] hover:text-white whitespace-nowrap">Support</button>
         </div>
 
         <!-- TAB 1: OVERVIEW -->
@@ -621,24 +832,46 @@ function renderWebApp() {
                 <i class="fa-solid fa-robot"></i>
               </div>
               <div>
-                <h3 class="fithub-heading text-lg text-white">AI FITNESS COACH</h3>
-                <p class="text-xs text-[#B5B5B5]">Server-side Gemini AI grounded in your real profile, workout, and diet records.</p>
+                <h3 class="fithub-heading text-lg text-white" data-i18n="ai_coach_title">AI FITNESS COACH</h3>
+                <p class="text-xs text-[#B5B5B5]" data-i18n="ai_coach_desc">Server-side Gemini AI grounded in your real profile, workout, and diet records.</p>
+              </div>
+            </div>
+
+            <!-- Suggested Questions Chips -->
+            <div class="mb-3">
+              <span class="text-[10px] uppercase font-bold text-[#858585] block mb-1.5" data-i18n="suggested_questions">Suggested Questions:</span>
+              <div id="aiSuggestedQuestions" class="flex flex-wrap gap-1.5 text-xs">
+                <!-- Dynamically populated chips -->
               </div>
             </div>
 
             <!-- Chat box -->
-            <div id="aiChatBox" class="h-64 overflow-y-auto bg-[#0A0A0A] p-4 rounded-xl border border-[#393939] space-y-3 text-xs mb-3">
+            <div id="aiChatBox" class="h-72 overflow-y-auto bg-[#0A0A0A] p-4 rounded-xl border border-[#393939] space-y-3 text-xs mb-3">
               <div class="flex items-start space-x-2">
-                <div class="bg-[#242424] p-3 rounded-xl max-w-[85%] text-white">
-                  👋 Hello! I am your FIT HUB AI Fitness Coach. Ask me about your assigned workout, macro targets, or form recommendations!
+                <div class="bg-[#242424] p-3 rounded-xl max-w-[85%] text-white" id="aiWelcomeMessage">
+                  👋 Hello! I am your FIT HUB AI Fitness Coach. Ask me about your assigned workout, macro targets, attendance, or upcoming classes!
                 </div>
               </div>
             </div>
 
+            <!-- Loading indicator -->
+            <div id="aiLoadingIndicator" class="hidden flex items-center space-x-2 px-3 py-1.5 mb-2 text-xs text-[#B5B5B5] bg-[#171717] rounded-lg border border-[#2c2c2c] w-fit">
+              <span class="w-2 h-2 rounded-full bg-[#F0441D] animate-ping"></span>
+              <span id="aiLoadingText">Coach is analyzing your data...</span>
+            </div>
+
+            <!-- Error banner with retry button -->
+            <div id="aiErrorContainer" class="hidden p-3 rounded-xl text-xs bg-red-500/15 border border-red-500/30 text-red-300 flex items-center justify-between gap-2 mb-3">
+              <span id="aiErrorMessage">AI Coach is temporarily unavailable. Please try again later.</span>
+              <button id="aiRetryBtn" onclick="retryAiMessage()" class="btn-orange px-3 py-1 text-xs font-bold whitespace-nowrap">
+                <i class="fa-solid fa-rotate-right mr-1"></i> <span data-i18n="btn_retry">Retry</span>
+              </button>
+            </div>
+
             <div class="flex items-center space-x-2">
-              <input type="text" id="aiInput" placeholder="Ask your coach anything..." class="input-field flex-1 p-2.5 text-xs">
-              <button onclick="sendAiMessage()" class="btn-orange px-4 py-2.5 text-xs font-bold">
-                <i class="fa-solid fa-paper-plane mr-1"></i> Send
+              <input type="text" id="aiInput" data-i18n-placeholder="ai_input_placeholder" placeholder="Ask your coach anything..." class="input-field flex-1 p-2.5 text-xs" onkeydown="if(event.key==='Enter') sendAiMessage()">
+              <button onclick="sendAiMessage()" id="aiSendBtn" class="btn-orange px-4 py-2.5 text-xs font-bold flex items-center gap-1.5">
+                <i class="fa-solid fa-paper-plane"></i> <span data-i18n="btn_send">Send</span>
               </button>
             </div>
           </div>
@@ -1324,9 +1557,387 @@ function renderWebApp() {
     let authToken = localStorage.getItem('fithub_auth_token') || null;
     let currentUser = null;
     let currentRole = 'MEMBER';
-    let currentLang = 'en';
+    let currentLang = localStorage.getItem('fithub_lang') || 'en';
     let authMode = 'signin';
     let memberDashboardData = null;
+    let lastAiQuestion = '';
+
+    // Centralized Application Translation Dictionary
+    const translations = {
+      en: {
+        brand_subtitle: "Enterprise Gym Management",
+        btn_install: "Install App",
+        btn_refresh: "Refresh",
+        status_authenticated: "Authenticated",
+        offline_banner: "Offline Mode — Cached FitHub data is active. Reconnect to sync turnstile check-ins and payments.",
+        tab_overview: "Dashboard",
+        tab_workout: "Workout",
+        tab_diet: "Diet",
+        tab_progress: "Progress & BMI",
+        tab_goals: "Goals",
+        tab_qr: "QR Pass",
+        tab_classes: "Classes & Billing",
+        tab_aicoach: "🤖 AI Coach",
+        tab_support: "Support",
+        login_welcome: "WELCOME BACK",
+        login_create: "CREATE ACCOUNT",
+        login_sub_signin: "Sign in to your authenticated account",
+        login_sub_register: "Register your clean member account",
+        label_email: "Email / Mobile",
+        label_password: "Password",
+        label_fullname: "Full Name",
+        btn_signin: "SIGN IN",
+        btn_create_acc: "CREATE ACCOUNT",
+        btn_forgot_pass: "Forgot Password?",
+        prompt_have_acc: "Already have an account?",
+        prompt_no_acc: "Don't have an account?",
+        link_signin: "Sign In",
+        link_register: "Create Account",
+        back_to_roles: "Back to roles",
+        role_select_title: "CHOOSE YOUR ROLE",
+        role_select_sub: "Your complete fitness ecosystem",
+        days_remaining: "DAYS REMAINING",
+        attendance_streak: "ATTENDANCE STREAK",
+        total_checkins: "TOTAL CHECK-INS",
+        monthly_attendance: "MONTHLY ATTENDANCE",
+        activate_plan: "Activate Plan",
+        instant_turnstile: "Instant Turnstile Access",
+        consecutive_days: "Consecutive Training",
+        lifetime_scans: "Lifetime Scans",
+        target_eighty: "Target 80%+",
+        today_routine: "TODAY'S TRAINING ROUTINE",
+        nutrition_macros: "NUTRITION & MACROS",
+        view_routine: "View Full Routine",
+        view_diet: "View Diet Plan",
+        open_qr_pass: "Open Digital Pass",
+        gate_pass_label: "Turnstile Gate Pass",
+        active_member: "ACTIVE MEMBER",
+        no_active_msh: "No active membership",
+        no_active_msh_desc: "You do not have an active membership. Assign or purchase a plan to unlock turnstiles and training facilities.",
+        no_workout_title: "No workout assigned yet",
+        no_workout_sub: "Your trainer has not assigned a workout routine yet.",
+        btn_request_routine: "Request / Assign Routine",
+        no_diet_title: "No diet assigned yet",
+        no_diet_sub: "Your nutritionist has not assigned a diet plan yet.",
+        btn_request_diet: "Request Diet Plan",
+        no_diet_desc: "No nutrition protocol or calorie target is currently active for your profile.",
+        btn_set_nutrition: "Set Nutrition Targets",
+        no_progress_title: "No progress records yet",
+        no_progress_sub: "Track your body weight, BMI score, and measurements over time.",
+        btn_log_weight: "Log Your First Weight",
+        no_goals_title: "No goals yet",
+        no_goals_sub: "Set target milestones for weight, personal strength records, or weekly workout frequency.",
+        btn_create_goal: "Create Your First Goal",
+        qr_locked_title: "Turnstile Gate Pass Locked",
+        qr_locked_sub: "Digital QR access activates automatically when you have an active membership plan.",
+        btn_activate_msh: "Activate Membership",
+        no_bookings_title: "No upcoming bookings",
+        no_bookings_sub: "You have not booked any group classes yet.",
+        no_notifs: "No notifications.",
+        no_tickets: "No support tickets.",
+        branch_ops: "BRANCH OPERATIONS",
+        total_members_kpi: "TOTAL MEMBERS",
+        active_msh_kpi: "ACTIVE MEMBERSHIPS",
+        today_checkins_kpi: "TODAY'S CHECK-INS",
+        net_revenue_kpi: "NET BRANCH REVENUE",
+        member_roster_title: "MEMBER ROSTER",
+        crm_pipeline_title: "CRM LEADS PIPELINE",
+        inventory_title: "SUPPLEMENTS & INVENTORY",
+        btn_roster_csv: "Roster CSV",
+        btn_stock_csv: "Stock CSV",
+        btn_run_jobs: "Run Jobs",
+        btn_new_sku: "New SKU",
+        btn_new_lead: "New Lead",
+        th_member_name: "Member Name",
+        th_email: "Email",
+        th_active_plan: "Active Plan",
+        th_status: "Status",
+        th_days_left: "Days Left",
+        trainer_sub_title: "ATHLETE COACHING & SESSIONS",
+        trainer_hub_title: "TRAINER PERFORMANCE HUB",
+        assigned_athletes_kpi: "ASSIGNED ATHLETES",
+        sessions_today_kpi: "SESSIONS TODAY",
+        adherence_rate_kpi: "AVG CLIENT ADHERENCE",
+        active_protocols_kpi: "ACTIVE PROTOCOLS",
+        my_athletes_title: "MY ATHLETES & TRAINING PROGRESS",
+        btn_assign_routine: "Assign Routine",
+        btn_set_macros: "Set Macros",
+        btn_log_note: "Log Note",
+        th_athlete: "Athlete",
+        th_current_goal: "Current Goal",
+        th_assigned_routine: "Assigned Routine",
+        th_macro_protocol: "Macro Protocol",
+        th_streak: "Streak",
+        th_adherence: "Adherence",
+        th_action: "Action",
+        superadmin_sub_title: "PLATFORM SUPER ADMINISTRATION",
+        superadmin_hub_title: "ENTERPRISE ECOSYSTEM",
+        kpi_total_gyms: "TOTAL GYMS",
+        kpi_active_branches: "ACTIVE BRANCHES",
+        kpi_total_users: "TOTAL USERS",
+        kpi_platform_revenue: "PLATFORM REVENUE",
+        superadmin_audit_title: "SYSTEM AUDIT TRAIL (IMMUTABLE LOGS)",
+        ai_coach_title: "AI FITNESS COACH",
+        ai_coach_desc: "Server-side Gemini AI grounded in your real profile, workout, and diet records.",
+        suggested_questions: "Suggested Questions:",
+        ai_welcome_msg: "👋 Hello! I am your FIT HUB AI Fitness Coach. Ask me about your assigned workout, macro targets, attendance, or upcoming classes!",
+        ai_loading: "Coach is analyzing your data...",
+        ai_error: "AI Coach is temporarily unavailable. Please try again later.",
+        ai_input_placeholder: "Ask your coach anything...",
+        btn_send: "Send",
+        btn_retry: "Retry",
+        notifs_modal_title: "NOTIFICATIONS",
+        btn_mark_all_read: "Mark All Read",
+        support_tickets_title: "SUPPORT TICKETS",
+        btn_new_ticket: "New Ticket"
+      },
+      hi: {
+        brand_subtitle: "एंटरप्राइज जिम प्रबंधन",
+        btn_install: "ऐप इंस्टॉल करें",
+        btn_refresh: "रिफ्रेश",
+        status_authenticated: "प्रमाणित",
+        offline_banner: "ऑफलाइन मोड — कैश्ड फिटहब डेटा सक्रिय है। टर्नस्टाइल चेक-इन और भुगतान सिंक करने के लिए पुनः कनेक्ट करें।",
+        tab_overview: "डैशबोर्ड",
+        tab_workout: "वर्कआउट",
+        tab_diet: "डाइट",
+        tab_progress: "प्रोग्रेस व बीएमआई",
+        tab_goals: "लक्ष्य",
+        tab_qr: "क्यूआर पास",
+        tab_classes: "क्लासेज व बिलिंग",
+        tab_aicoach: "🤖 एआई कोच",
+        tab_support: "सहायता",
+        login_welcome: "वापसी पर स्वागत है",
+        login_create: "खाता बनाएं",
+        login_sub_signin: "अपने प्रमाणित खाते में साइन इन करें",
+        login_sub_register: "अपना नया सदस्य खाता पंजीकृत करें",
+        label_email: "ईमेल / मोबाइल",
+        label_password: "पासवर्ड",
+        label_fullname: "पूरा नाम",
+        btn_signin: "साइन इन",
+        btn_create_acc: "खाता बनाएं",
+        btn_forgot_pass: "पासवर्ड भूल गए?",
+        prompt_have_acc: "क्या पहले से खाता है?",
+        prompt_no_acc: "खाता नहीं है?",
+        link_signin: "साइन इन करें",
+        link_register: "खाता बनाएं",
+        back_to_roles: "भूमिकाओं पर वापस",
+        role_select_title: "अपनी भूमिका चुनें",
+        role_select_sub: "आपका संपूर्ण फिटनेस इकोसिस्टम",
+        days_remaining: "शेष दिन",
+        attendance_streak: "उपस्थिति स्ट्रीक",
+        total_checkins: "कुल चेक-इन",
+        monthly_attendance: "मासिक उपस्थिति",
+        activate_plan: "प्लान सक्रिय करें",
+        instant_turnstile: "त्वरित टर्नस्टाइल एक्सेस",
+        consecutive_days: "लगातार प्रशिक्षण",
+        lifetime_scans: "कुल स्कैन",
+        target_eighty: "लक्ष्य 80%+",
+        today_routine: "आज का वर्कआउट रूटीन",
+        nutrition_macros: "पोषण व मैक्रोज़",
+        view_routine: "पूरा रूटीन देखें",
+        view_diet: "डाइट प्लान देखें",
+        open_qr_pass: "डिजिटल पास खोलें",
+        gate_pass_label: "टर्नस्टाइल गेट पास",
+        active_member: "सक्रिय सदस्य",
+        no_active_msh: "कोई सक्रिय सदस्यता नहीं",
+        no_active_msh_desc: "आपकी कोई सक्रिय सदस्यता नहीं है। टर्नस्टाइल और प्रशिक्षण सुविधाओं को अनलॉक करने के लिए प्लान सक्रिय करें।",
+        no_workout_title: "अभी कोई वर्कआउट असाइन नहीं किया गया है",
+        no_workout_sub: "आपके ट्रेनर ने अभी कोई वर्कआउट रूटीन असाइन नहीं किया है।",
+        btn_request_routine: "रूटीन असाइन करें",
+        no_diet_title: "अभी कोई डाइट प्लान असाइन नहीं किया गया है",
+        no_diet_sub: "आपके न्यूट्रिशनिस्ट ने अभी कोई डाइट प्लान असाइन नहीं किया है।",
+        btn_request_diet: "डाइट प्लान का अनुरोध करें",
+        no_diet_desc: "आपकी प्रोफ़ाइल के लिए कोई पोषण प्रोटोकॉल या कैलोरी लक्ष्य सक्रिय नहीं है।",
+        btn_set_nutrition: "पोषण लक्ष्य सेट करें",
+        no_progress_title: "कोई प्रोग्रेस रिकॉर्ड नहीं है",
+        no_progress_sub: "समय के साथ अपने शरीर के वजन, बीएमआई और मापों को ट्रैक करें।",
+        btn_log_weight: "पहला वजन दर्ज करें",
+        no_goals_title: "अभी कोई लक्ष्य नहीं है",
+        no_goals_sub: "वजन, व्यक्तिगत शक्ति रिकॉर्ड, या साप्ताहिक वर्कआउट के लिए मील के पत्थर निर्धारित करें।",
+        btn_create_goal: "पहला लक्ष्य बनाएं",
+        qr_locked_title: "टर्नस्टाइल गेट पास लॉक है",
+        qr_locked_sub: "सक्रिय सदस्यता प्लान होने पर डिजिटल क्यूआर एक्सेस स्वचालित रूप से सक्रिय होता है।",
+        btn_activate_msh: "सदस्यता सक्रिय करें",
+        no_bookings_title: "कोई आगामी बुकिंग नहीं है",
+        no_bookings_sub: "आपने अभी तक कोई ग्रुप क्लास बुक नहीं की है।",
+        no_notifs: "कोई नई सूचना नहीं है।",
+        no_tickets: "कोई सहायता टिकट नहीं है।",
+        branch_ops: "शाखा संचालन",
+        total_members_kpi: "कुल सदस्य",
+        active_msh_kpi: "सक्रिय सदस्यताएं",
+        today_checkins_kpi: "आज के चेक-इन",
+        net_revenue_kpi: "कुल शाखा राजस्व",
+        member_roster_title: "सदस्य सूची",
+        crm_pipeline_title: "सीआरएम लीड्स पाइपलाइन",
+        inventory_title: "सप्लीमेंट्स व इन्वेंट्री",
+        btn_roster_csv: "रोस्टर सीएसवी",
+        btn_stock_csv: "स्टॉक सीएसवी",
+        btn_run_jobs: "जॉब्स चलाएं",
+        btn_new_sku: "नया एसकेयू",
+        btn_new_lead: "नई लीड",
+        th_member_name: "सदस्य का नाम",
+        th_email: "ईमेल",
+        th_active_plan: "सक्रिय प्लान",
+        th_status: "स्थिति",
+        th_days_left: "शेष दिन",
+        trainer_sub_title: "एथलीट कोचिंग व सत्र",
+        trainer_hub_title: "ट्रेनर परफॉर्मेंस हब",
+        assigned_athletes_kpi: "असाइन किए गए एथलीट",
+        sessions_today_kpi: "आज के सत्र",
+        adherence_rate_kpi: "औसत क्लाइंट पालन",
+        active_protocols_kpi: "सक्रिय प्रोटोकॉल",
+        my_athletes_title: "मेरे एथलीट व प्रशिक्षण प्रोग्रेस",
+        btn_assign_routine: "रूटीन असाइन करें",
+        btn_set_macros: "मैक्रोज़ सेट करें",
+        btn_log_note: "नोट दर्ज करें",
+        th_athlete: "एथलीट",
+        th_current_goal: "वर्तमान लक्ष्य",
+        th_assigned_routine: "असाइन किया गया रूटीन",
+        th_macro_protocol: "मैक्रो प्रोटोकॉल",
+        th_streak: "स्ट्रीक",
+        th_adherence: "पालन दर",
+        th_action: "कार्रवाई",
+        superadmin_sub_title: "प्लेटफॉर्म सुपर एडमिनिस्ट्रेशन",
+        superadmin_hub_title: "एंटरप्राइज इकोसिस्टम",
+        kpi_total_gyms: "कुल जिम",
+        kpi_active_branches: "सक्रिय शाखाएं",
+        kpi_total_users: "कुल उपयोगकर्ता",
+        kpi_platform_revenue: "प्लेटफॉर्म राजस्व",
+        superadmin_audit_title: "सिस्टम ऑडिट ट्रेल (अपरिवर्तनीय लॉग)",
+        ai_coach_title: "एआई फिटनेस कोच",
+        ai_coach_desc: "सर्वर-साइड जेमिनी एआई आपकी वास्तविक प्रोफ़ाइल, वर्कआउट और डाइट रिकॉर्ड पर आधारित।",
+        suggested_questions: "सुझाए गए प्रश्न:",
+        ai_welcome_msg: "👋 नमस्ते! मैं आपका FIT HUB AI फिटनेस कोच हूँ। मुझसे अपने वर्कआउट, डाइट मैक्रोज़, अटेंडेंस या आगामी क्लास के बारे में पूछें!",
+        ai_loading: "कोच आपका डेटा देख रहा है...",
+        ai_error: "AI Coach अभी उपलब्ध नहीं है। कृपया थोड़ी देर बाद फिर कोशिश करें।",
+        ai_input_placeholder: "अपने कोच से कुछ भी पूछें...",
+        btn_send: "भेजें",
+        btn_retry: "पुनः प्रयास करें",
+        notifs_modal_title: "सूचनाएं",
+        btn_mark_all_read: "सभी को पढ़ा हुआ चिन्हित करें",
+        support_tickets_title: "सहायता टिकट",
+        btn_new_ticket: "नया टिकट"
+      }
+    };
+
+    function t(key, fallback) {
+      if (translations[currentLang] && translations[currentLang][key] !== undefined) {
+        return translations[currentLang][key];
+      }
+      return fallback !== undefined ? fallback : (translations.en[key] || key);
+    }
+
+    const aiSuggestedQuestionsData = {
+      en: [
+        "What is my workout today?",
+        "What is my membership status?",
+        "How is my attendance?",
+        "What are my current goals?",
+        "Show my recent progress.",
+        "What class do I have next?"
+      ],
+      hi: [
+        "आज मेरा वर्कआउट क्या है?",
+        "मेरी मेंबरशिप कब तक है?",
+        "मेरी अटेंडेंस कैसी है?",
+        "मेरे वर्तमान गोल क्या हैं?",
+        "मेरी हाल की प्रोग्रेस बताओ।",
+        "मेरी अगली क्लास कब है?"
+      ]
+    };
+
+    function renderAiSuggestedQuestions() {
+      const container = document.getElementById('aiSuggestedQuestions');
+      if (!container) return;
+      const questions = aiSuggestedQuestionsData[currentLang] || aiSuggestedQuestionsData.en;
+      container.innerHTML = '';
+      questions.forEach(function(q) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'px-2.5 py-1 rounded-lg bg-[#242424] hover:bg-[#2c2c2c] border border-[#393939] text-white hover:border-[#F0441D] transition text-[11px] text-left';
+        btn.textContent = q;
+        btn.onclick = function() { askSuggestedQuestion(q); };
+        container.appendChild(btn);
+      });
+    }
+
+    function askSuggestedQuestion(q) {
+      const input = document.getElementById('aiInput');
+      if (input) {
+        input.value = q;
+        sendAiMessage();
+      }
+    }
+
+    function setLanguage(lang) {
+      currentLang = (lang === 'hi') ? 'hi' : 'en';
+      localStorage.setItem('fithub_lang', currentLang);
+      applyTranslations();
+    }
+
+    function toggleLang() {
+      setLanguage(currentLang === 'en' ? 'hi' : 'en');
+    }
+
+    function applyTranslations() {
+      // 1. Static element text
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        const translated = t(key);
+        if (translated) {
+          el.innerText = translated;
+        }
+      });
+
+      // 2. Placeholder attributes
+      document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+        const key = el.getAttribute('data-i18n-placeholder');
+        const translated = t(key);
+        if (translated) {
+          el.placeholder = translated;
+        }
+      });
+
+      // 3. Switcher buttons
+      const btnEn = document.getElementById('langBtnEn');
+      const btnHi = document.getElementById('langBtnHi');
+      if (btnEn && btnHi) {
+        if (currentLang === 'hi') {
+          btnHi.className = 'px-2.5 py-1 rounded-lg transition text-white bg-[#F0441D]';
+          btnEn.className = 'px-2.5 py-1 rounded-lg transition text-[#858585] hover:text-white bg-transparent';
+        } else {
+          btnEn.className = 'px-2.5 py-1 rounded-lg transition text-white bg-[#F0441D]';
+          btnHi.className = 'px-2.5 py-1 rounded-lg transition text-[#858585] hover:text-white bg-transparent';
+        }
+      }
+      const langBtnText = document.getElementById('langBtnText');
+      if (langBtnText) {
+        langBtnText.innerText = currentLang === 'en' ? 'हिन्दी' : 'EN';
+      }
+
+      // 4. Update login page texts
+      setAuthMode(authMode);
+
+      // 5. Update AI coach greeting and suggested questions
+      const welcomeEl = document.getElementById('aiWelcomeMessage');
+      if (welcomeEl) {
+        welcomeEl.innerText = t('ai_welcome_msg');
+      }
+      const loadingEl = document.getElementById('aiLoadingText');
+      if (loadingEl) {
+        loadingEl.innerText = t('ai_loading');
+      }
+      const errEl = document.getElementById('aiErrorMessage');
+      if (errEl) {
+        errEl.innerText = t('ai_error');
+      }
+      renderAiSuggestedQuestions();
+
+      // 6. Dynamic active dashboard re-rendering
+      if (currentRole === 'MEMBER' && memberDashboardData) {
+        renderMemberDashboardUI(memberDashboardData);
+      }
+    }
 
     // Base API helper
     async function apiRequest(endpoint, method = 'GET', body = null) {
@@ -1373,19 +1984,19 @@ function renderWebApp() {
       if (fullNameGroup) fullNameGroup.classList.toggle('hidden', !isReg);
       
       const titleEl = document.getElementById('loginPageTitle');
-      if (titleEl) titleEl.innerText = isReg ? 'CREATE ACCOUNT' : 'WELCOME BACK';
+      if (titleEl) titleEl.innerText = isReg ? t('login_create', 'CREATE ACCOUNT') : t('login_welcome', 'WELCOME BACK');
 
       const subtitleEl = document.getElementById('loginSubtitle');
-      if (subtitleEl) subtitleEl.innerText = isReg ? 'Register your clean member account' : 'Sign in to your authenticated account';
+      if (subtitleEl) subtitleEl.innerText = isReg ? t('login_sub_register', 'Register your clean member account') : t('login_sub_signin', 'Sign in to your authenticated account');
 
       const submitBtn = document.getElementById('authSubmitBtn');
-      if (submitBtn) submitBtn.innerText = isReg ? 'CREATE ACCOUNT' : 'SIGN IN';
+      if (submitBtn) submitBtn.innerText = isReg ? t('btn_create_acc', 'CREATE ACCOUNT') : t('btn_signin', 'SIGN IN');
 
       const togglePrompt = document.getElementById('authTogglePrompt');
-      if (togglePrompt) togglePrompt.innerText = isReg ? 'Already have an account?' : "Don't have an account?";
+      if (togglePrompt) togglePrompt.innerText = isReg ? t('prompt_have_acc', 'Already have an account?') : t('prompt_no_acc', "Don't have an account?");
 
       const toggleBtn = document.getElementById('authToggleBtn');
-      if (toggleBtn) toggleBtn.innerText = isReg ? 'Sign In' : 'Create Account';
+      if (toggleBtn) toggleBtn.innerText = isReg ? t('link_signin', 'Sign In') : t('link_register', 'Create Account');
 
       const alertBox = document.getElementById('authAlert');
       if (alertBox) alertBox.classList.add('hidden');
@@ -1627,10 +2238,10 @@ function renderWebApp() {
       if (!w) {
         const emptyHtml = \`
           <div class="py-4 text-center">
-            <p class="text-sm font-semibold text-white">No workout assigned yet</p>
-            <p class="text-xs text-[#858585] mt-1">Your trainer has not assigned a workout routine yet.</p>
+            <p class="text-sm font-semibold text-white">\${t('no_workout_title', 'No workout assigned yet')}</p>
+            <p class="text-xs text-[#858585] mt-1">\${t('no_workout_sub', 'Your trainer has not assigned a workout routine yet.')}</p>
             <button onclick="apiAssignWorkout()" class="btn-secondary text-xs px-3.5 py-1.5 mt-3">
-              <i class="fa-solid fa-plus mr-1"></i> Request / Assign Routine
+              <i class="fa-solid fa-plus mr-1"></i> \${t('btn_request_routine', 'Request / Assign Routine')}
             </button>
           </div>
         \`;
@@ -1638,10 +2249,10 @@ function renderWebApp() {
         scr.innerHTML = \`
           <div class="glass-card p-8 text-center border border-[#393939]">
             <i class="fa-solid fa-dumbbell text-3xl text-[#858585] mb-2"></i>
-            <h4 class="text-base font-bold text-white">No workout assigned yet</h4>
-            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">Your personal coach or gym instructor has not scheduled a workout program for your profile yet.</p>
+            <h4 class="text-base font-bold text-white">\${t('no_workout_title', 'No workout assigned yet')}</h4>
+            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">\${t('no_workout_sub', 'Your personal coach or gym instructor has not scheduled a workout program for your profile yet.')}</p>
             <button onclick="apiAssignWorkout()" class="btn-orange text-xs px-4 py-2 mt-4 font-bold">
-              <i class="fa-solid fa-plus mr-1"></i> Assign Training Program
+              <i class="fa-solid fa-plus mr-1"></i> \${t('btn_request_routine', 'Assign Training Program')}
             </button>
           </div>
         \`;
@@ -1679,10 +2290,10 @@ function renderWebApp() {
       if (!d) {
         const emptyHtml = \`
           <div class="py-4 text-center">
-            <p class="text-sm font-semibold text-white">No diet assigned yet</p>
-            <p class="text-xs text-[#858585] mt-1">Your nutritionist has not assigned a diet plan yet.</p>
+            <p class="text-sm font-semibold text-white">\${t('no_diet_title', 'No diet assigned yet')}</p>
+            <p class="text-xs text-[#858585] mt-1">\${t('no_diet_sub', 'Your nutritionist has not assigned a diet plan yet.')}</p>
             <button onclick="apiAssignDiet()" class="btn-secondary text-xs px-3.5 py-1.5 mt-3">
-              <i class="fa-solid fa-plus mr-1"></i> Request Diet Plan
+              <i class="fa-solid fa-plus mr-1"></i> \${t('btn_request_diet', 'Request Diet Plan')}
             </button>
           </div>
         \`;
@@ -1690,10 +2301,10 @@ function renderWebApp() {
         scr.innerHTML = \`
           <div class="glass-card p-8 text-center border border-[#393939]">
             <i class="fa-solid fa-utensils text-3xl text-[#858585] mb-2"></i>
-            <h4 class="text-base font-bold text-white">No diet assigned yet</h4>
-            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">No nutrition protocol or calorie target is currently active for your profile.</p>
+            <h4 class="text-base font-bold text-white">\${t('no_diet_title', 'No diet assigned yet')}</h4>
+            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">\${t('no_diet_desc', 'No nutrition protocol or calorie target is currently active for your profile.')}</p>
             <button onclick="apiAssignDiet()" class="btn-orange text-xs px-4 py-2 mt-4 font-bold">
-              <i class="fa-solid fa-plus mr-1"></i> Set Nutrition Targets
+              <i class="fa-solid fa-plus mr-1"></i> \${t('btn_set_nutrition', 'Set Nutrition Targets')}
             </button>
           </div>
         \`;
@@ -1740,10 +2351,10 @@ function renderWebApp() {
         box.innerHTML = \`
           <div class="glass-card p-8 text-center border border-[#393939]">
             <i class="fa-solid fa-chart-line text-3xl text-[#858585] mb-2"></i>
-            <h4 class="text-base font-bold text-white">No progress records yet</h4>
-            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">Track your body weight, BMI score, and measurements over time.</p>
+            <h4 class="text-base font-bold text-white">\${t('no_progress_title', 'No progress records yet')}</h4>
+            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">\${t('no_progress_sub', 'Track your body weight, BMI score, and measurements over time.')}</p>
             <button onclick="openModal('logProgressModal')" class="btn-orange text-xs px-4 py-2 mt-4 font-bold">
-              <i class="fa-solid fa-plus mr-1"></i> Log Your First Weight
+              <i class="fa-solid fa-plus mr-1"></i> \${t('btn_log_weight', 'Log Your First Weight')}
             </button>
           </div>
         \`;
@@ -1774,10 +2385,10 @@ function renderWebApp() {
         box.innerHTML = \`
           <div class="glass-card p-8 text-center border border-[#393939]">
             <i class="fa-solid fa-bullseye text-3xl text-[#858585] mb-2"></i>
-            <h4 class="text-base font-bold text-white">No goals yet</h4>
-            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">Set target milestones for weight, personal strength records, or weekly workout frequency.</p>
+            <h4 class="text-base font-bold text-white">\${t('no_goals_title', 'No goals yet')}</h4>
+            <p class="text-xs text-[#858585] mt-1 max-w-sm mx-auto">\${t('no_goals_sub', 'Set target milestones for weight, personal strength records, or weekly workout frequency.')}</p>
             <button onclick="openModal('createGoalModal')" class="btn-orange text-xs px-4 py-2 mt-4 font-bold">
-              <i class="fa-solid fa-plus mr-1"></i> Create Your First Goal
+              <i class="fa-solid fa-plus mr-1"></i> \${t('btn_create_goal', 'Create Your First Goal')}
             </button>
           </div>
         \`;
@@ -1804,17 +2415,17 @@ function renderWebApp() {
         box.innerHTML = \`
           <div class="max-w-md mx-auto glass-card p-8 text-center border border-[#393939]">
             <i class="fa-solid fa-lock text-3xl text-[#858585] mb-2"></i>
-            <h4 class="text-base font-bold text-white">Turnstile Gate Pass Locked</h4>
-            <p class="text-xs text-[#858585] mt-1">Digital QR access activates automatically when you have an active membership plan.</p>
+            <h4 class="text-base font-bold text-white">\${t('qr_locked_title', 'Turnstile Gate Pass Locked')}</h4>
+            <p class="text-xs text-[#858585] mt-1">\${t('qr_locked_sub', 'Digital QR access activates automatically when you have an active membership plan.')}</p>
             <button onclick="openModal('assignPlanModal')" class="btn-orange text-xs px-4 py-2 mt-4 font-bold">
-              Activate Membership
+              \${t('btn_activate_msh', 'Activate Membership')}
             </button>
           </div>
         \`;
       } else {
         box.innerHTML = \`
           <div class="max-w-md mx-auto glass-card p-6 text-center border-2 border-[#F0441D]">
-            <span class="text-[10px] uppercase font-black tracking-widest text-[#F0441D]">FIT HUB DIGITAL ACCESS PASS</span>
+            <span class="text-[10px] uppercase font-black tracking-widest text-[#F0441D]">\${t('gate_pass_label', 'FIT HUB DIGITAL ACCESS PASS')}</span>
             <h3 class="fithub-heading text-xl text-white mt-1">\${(currentUser?.fullName || 'ATHLETE').toUpperCase()}</h3>
             <p class="text-xs text-[#B5B5B5]">\${membership.planName} • Valid</p>
             <div class="my-5 w-44 h-44 bg-white rounded-xl mx-auto flex items-center justify-center p-2 shadow-inner">
@@ -1831,8 +2442,8 @@ function renderWebApp() {
       if (!bookings || bookings.length === 0) {
         bBox.innerHTML = \`
           <div class="glass-card p-5 text-center border border-[#393939]">
-            <p class="text-sm font-bold text-white">No upcoming bookings</p>
-            <p class="text-xs text-[#858585] mt-1">You have not booked any group classes yet.</p>
+            <p class="text-sm font-bold text-white">\${t('no_bookings_title', 'No upcoming bookings')}</p>
+            <p class="text-xs text-[#858585] mt-1">\${t('no_bookings_sub', 'You have not booked any group classes yet.')}</p>
           </div>
         \`;
       } else {
@@ -1917,7 +2528,7 @@ function renderWebApp() {
       const box = document.getElementById('notificationsList');
       if (!list || list.length === 0) {
         dot.classList.add('hidden');
-        box.innerHTML = '<p class="text-center text-[#858585] py-4">No notifications.</p>';
+        box.innerHTML = '<p class="text-center text-[#858585] py-4">' + t('no_notifs', 'No notifications.') + '</p>';
       } else {
         dot.classList.remove('hidden');
         box.innerHTML = list.map(n => \`
@@ -2462,17 +3073,45 @@ function renderWebApp() {
     }
 
     // AI Coach Interaction
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     async function sendAiMessage() {
       const input = document.getElementById('aiInput');
-      const text = input.value.trim();
+      const text = input ? input.value.trim() : '';
       if (!text) return;
 
+      lastAiQuestion = text;
       const box = document.getElementById('aiChatBox');
-      box.innerHTML += '<div class="flex items-start justify-end space-x-2">' +
-        '<div class="bg-[#F0441D]/20 border border-[#F0441D]/40 p-2.5 rounded-xl max-w-[85%] text-white">' + text + '</div>' +
-      '</div>';
-      input.value = '';
-      box.scrollTop = box.scrollHeight;
+      const loading = document.getElementById('aiLoadingIndicator');
+      const loadingText = document.getElementById('aiLoadingText');
+      const errBox = document.getElementById('aiErrorContainer');
+      const errText = document.getElementById('aiErrorMessage');
+      const sendBtn = document.getElementById('aiSendBtn');
+
+      // Append user bubble
+      if (box) {
+        box.innerHTML += '<div class="flex items-start justify-end space-x-2">' +
+          '<div class="bg-[#F0441D]/20 border border-[#F0441D]/40 p-2.5 rounded-xl max-w-[85%] text-white text-xs">' + escapeHtml(text) + '</div>' +
+        '</div>';
+        box.scrollTop = box.scrollHeight;
+      }
+      if (input) input.value = '';
+
+      // Set UI state
+      if (loading) {
+        if (loadingText) loadingText.innerText = t('ai_loading');
+        loading.classList.remove('hidden');
+      }
+      if (errBox) errBox.classList.add('hidden');
+      if (sendBtn) sendBtn.disabled = true;
 
       try {
         const res = await apiRequest('/api/ai-assistant', 'POST', {
@@ -2480,18 +3119,38 @@ function renderWebApp() {
           language: currentLang
         });
 
-        box.innerHTML += '<div class="flex items-start space-x-2">' +
-          '<div class="bg-[#242424] p-3 rounded-xl max-w-[85%] text-white">' + res.answer + '</div>' +
-        '</div>';
-        box.scrollTop = box.scrollHeight;
+        if (box) {
+          box.innerHTML += '<div class="flex items-start space-x-2">' +
+            '<div class="w-6 h-6 rounded-full bg-[#F0441D]/20 border border-[#F0441D]/40 flex items-center justify-center text-[#F0441D] text-[10px] shrink-0 mt-0.5"><i class="fa-solid fa-robot"></i></div>' +
+            '<div class="bg-[#242424] p-3 rounded-xl max-w-[85%] text-white text-xs whitespace-pre-line leading-relaxed">' + escapeHtml(res.answer) + '</div>' +
+          '</div>';
+          box.scrollTop = box.scrollHeight;
+        }
       } catch (err) {
-        box.innerHTML += '<div class="text-red-400 text-xs">Coach is offline temporarily.</div>';
+        console.warn('AI Coach communication notice:', err);
+        const friendlyMsg = t('ai_error');
+        if (errBox && errText) {
+          errText.innerText = friendlyMsg;
+          errBox.classList.remove('hidden');
+        }
+        if (box) {
+          box.innerHTML += '<div class="flex items-start space-x-2">' +
+            '<div class="w-6 h-6 rounded-full bg-red-500/20 border border-red-500/40 flex items-center justify-center text-red-400 text-[10px] shrink-0 mt-0.5"><i class="fa-solid fa-triangle-exclamation"></i></div>' +
+            '<div class="bg-red-500/10 border border-red-500/20 p-2.5 rounded-xl max-w-[85%] text-red-300 text-xs">' + friendlyMsg + '</div>' +
+          '</div>';
+          box.scrollTop = box.scrollHeight;
+        }
+      } finally {
+        if (loading) loading.classList.add('hidden');
+        if (sendBtn) sendBtn.disabled = false;
       }
     }
 
-    function toggleLang() {
-      currentLang = currentLang === 'en' ? 'hi' : 'en';
-      document.getElementById('langBtnText').innerText = currentLang === 'en' ? 'हिन्दी' : 'EN';
+    function retryAiMessage() {
+      if (!lastAiQuestion) return;
+      const input = document.getElementById('aiInput');
+      if (input) input.value = lastAiQuestion;
+      sendAiMessage();
     }
 
     // PWA Install & Offline Management
@@ -2536,6 +3195,9 @@ function renderWebApp() {
 
     // App Initialization
     async function initApp() {
+      // Apply persisted language configuration
+      applyTranslations();
+
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('/sw.js').catch(err => {
           console.warn('[PWA] ServiceWorker notice:', err);
@@ -2553,10 +3215,12 @@ function renderWebApp() {
           if (path.includes('trainer') && currentUser.role !== 'TRAINER' && currentUser.role !== 'SUPER_ADMIN') {
             console.warn('Redirecting unauthorized user from trainer portal');
             await routeUserToDashboard(currentUser.role);
+            dismissSplashScreen();
             return;
           }
 
           await routeUserToDashboard(currentUser.role);
+          dismissSplashScreen();
           return;
         } catch (e) {
           localStorage.removeItem('fithub_auth_token');
@@ -2573,6 +3237,19 @@ function renderWebApp() {
         if (subtitleEl) subtitleEl.innerText = 'Sign in with your trainer credentials';
       }
       navigateTo('login');
+      dismissSplashScreen();
+    }
+
+    function dismissSplashScreen() {
+      const splash = document.getElementById('splashScreen');
+      if (splash) {
+        setTimeout(function() {
+          splash.classList.add('fade-out');
+          setTimeout(function() {
+            splash.style.display = 'none';
+          }, 500);
+        }, 1200);
+      }
     }
 
     initApp();

@@ -31,6 +31,7 @@ import com.example.ui.superadmin.SuperAdminDashboardScreen
 import com.example.ui.theme.*
 
 enum class AppScreen {
+    SPLASH,
     ROLE_SELECT,
     LOGIN,
     DASHBOARD
@@ -59,7 +60,7 @@ fun FitHubApp() {
         repository.initializeRoom(context, coroutineScope)
     }
 
-    var currentScreen by remember { mutableStateOf(AppScreen.DASHBOARD) } // Start directly on dashboard for instant testing, can switch anytime
+    var currentScreen by remember { mutableStateOf(AppScreen.SPLASH) }
     var authRole by remember { mutableStateOf(UserRole.MEMBER) }
 
     val currentRole by repository.currentRole.collectAsState()
@@ -70,6 +71,14 @@ fun FitHubApp() {
     var showNotificationsDialog by remember { mutableStateOf(false) }
 
     when (currentScreen) {
+        AppScreen.SPLASH -> {
+            FitHubSplashScreen(
+                onSplashFinished = {
+                    currentScreen = AppScreen.DASHBOARD
+                }
+            )
+        }
+
         AppScreen.ROLE_SELECT -> {
             RoleSelectionScreen(
                 onRoleSelected = { role ->
@@ -278,3 +287,63 @@ fun NotificationsModal(
         }
     }
 }
+
+@Composable
+fun FitHubSplashScreen(onSplashFinished: () -> Unit) {
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(1800)
+        onSplashFinished()
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0A0A))
+            .padding(24.dp)
+    ) {
+        // Centered Brand Title & Subtitle matching the user-uploaded image
+        Column(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "FIT",
+                fontSize = 58.sp,
+                fontWeight = FontWeight.Black,
+                color = FitHubPrimary,
+                letterSpacing = 2.sp
+            )
+            Text(
+                text = "HUB",
+                fontSize = 62.sp,
+                fontWeight = FontWeight.Black,
+                color = Color.White,
+                letterSpacing = (-1).sp
+            )
+        }
+
+        // Bottom version & partner info matching the user splash screen
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                text = "v1.0.0 | Total Fitness, Redefined.",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = Color(0xFFE5E5E5)
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = "Your Total Fitness Partner",
+                fontSize = 10.sp,
+                color = Color(0xFF757575)
+            )
+        }
+    }
+}
+

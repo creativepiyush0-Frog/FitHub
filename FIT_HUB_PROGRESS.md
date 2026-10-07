@@ -127,4 +127,25 @@ Verified via `node scripts/test_final_completion_suite.js`:
 - **BLOCKED**: 0
 
 ---
-Last Updated: 2026-10-07 (All 39 Phases & Final 32-Module QA Suite 100% Verified | 55/55 Tests Passed)
+
+## Production Feature Highlights: Language Switching, Free AI Fitness Coach, Custom App Icon & Splash Screen
+
+### 1. Custom FitHub Brand Icon & Splash Screen
+- **App Icons**: High-resolution raster and vector icons matching the user-provided squircle container with bold orange "FIT" and white "HUB" generated across PWA and native Android mipmaps (`icon-512.png`, `icon-192.png`, `apple-touch-icon.png`, `icon-maskable-512.png`, `icon.svg`, and Android `ic_launcher` WebP densities).
+- **Splash Screen**: Production splash screen with dark radial gradient backdrop, ambient pulse EKG lines, centralized FitHub brand emblem, and footer tagline (`v1.0.0 | Total Fitness, Redefined.` / `Your Total Fitness Partner`).
+- **Smooth Transition**: Built-in 1.2s viewing window followed by a graceful fade-out transition into the application.
+
+### 2. English / Hindi Language System (EN | HI)
+- **Centralized Translation Dictionary**: Bidirectional English (`en`) & Hindi (`hi`) dictionaries covering Navigation, Member Dashboard, Gym Admin, Super Admin, Trainer views, Login/Auth, empty states, modals, and notifications.
+- **Visual Feedback**: Active language selector button in the top navigation highlighted with signature FitHub orange (`#F0441D`) and persistent storage via `localStorage('fithub_lang')`.
+- **Safe Selective Translation**: Technical identifiers, UUIDs, email addresses, member IDs, invoice references, and user-generated notes are strictly preserved without transliteration.
+
+### 3. Free AI Fitness Coach (Google Gemini Integration)
+- **Architecture**: Secure server-to-server relay (`Member UI -> Server API (/api/ai-assistant) -> Gemini API -> Server Response -> Member UI`). Client JavaScript never accesses or exposes the API key.
+- **Model Hierarchy**: Gemini 3.8 Flash preferred, with resilient automated fallbacks to Gemini 3.5 Flash and Gemini 3.1 Flash Lite on 503 high demand or network timeouts, strictly observing free-tier rate limits.
+- **Tenant & Member Isolation**: Context injected into system prompt strictly scoped to the authenticated member's real FitHub database record (profile, active membership, remaining days, attendance streak, assigned workout, diet macros, active goals, body composition, and booked classes).
+- **Grounded Responses**: Strictly acknowledges when workouts, diets, or goals have not yet been assigned rather than hallucinating fake data, with full bilingual response capability in Hindi and English.
+- **Medical & Safety Guardrails**: Enforces non-medical assistant boundaries, refusing diagnoses and recommending licensed healthcare professionals for injuries.
+
+---
+Last Updated: 2026-10-07 (All 39 Phases, Final 32-Module QA Suite 55/55 Passed, Custom App Icon & Splash Screen Live)

@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1920" width="1080" height="1920">
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="52%" r="55%">
+      <stop offset="0%" stop-color="#181818"/>
+      <stop offset="60%" stop-color="#0D0D0D"/>
+      <stop offset="100%" stop-color="#050505"/>
+    </radialGradient>
+    <linearGradient id="curveGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#222222" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#0A0A0A" stop-opacity="0.0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Deep Dark Background -->
+  <rect width="1080" height="1920" fill="url(#bgGlow)"/>
+
+  <!-- Subtle Ambient Glow and Geometric Arc in background matching the user image -->
+  <path d="M -100 1300 Q 540 1050 1180 1450 L 1180 1920 L -100 1920 Z" fill="url(#curveGrad)"/>
+
+  <!-- Subtle EKG / Pulse lines behind and below logo matching the user image -->
+  <path d="M 400 950 L 640 950 L 670 920 L 700 990 L 730 880 L 760 1020 L 790 930 L 820 960 L 920 960" 
+        fill="none" stroke="#262626" stroke-width="3" stroke-linecap="round" opacity="0.45"/>
+  <path d="M 360 1480 L 460 1480 L 480 1450 L 500 1520 L 520 1410 L 540 1540 L 560 1460 L 580 1490 L 680 1490" 
+        fill="none" stroke="#222222" stroke-width="2.5" stroke-linecap="round" opacity="0.35"/>
+
+  <!-- Central FIT HUB Brand Logo -->
+  <g transform="translate(540, 930)">
+    <!-- FIT in signature vibrant orange -->
+    <text x="0" y="-30" 
+          text-anchor="middle" 
+          fill="#F0441D" 
+          font-family="system-ui, -apple-system, BlinkMacSystemFont, Arial Black, Impact, sans-serif" 
+          font-weight="900" 
+          font-size="220" 
+          letter-spacing="2">FIT</text>
+
+    <!-- HUB in clean bright white -->
+    <text x="0" y="200" 
+          text-anchor="middle" 
+          fill="#FFFFFF" 
+          font-family="system-ui, -apple-system, BlinkMacSystemFont, Arial Black, Impact, sans-serif" 
+          font-weight="900" 
+          font-size="230" 
+          letter-spacing="-1">HUB</text>
+  </g>
+
+  <!-- Bottom Brand Tagline & Version Matching User Splash Screen -->
+  <g transform="translate(540, 1820)">
+    <text x="0" y="0" 
+          text-anchor="middle" 
+          fill="#E5E5E5" 
+          font-family="system-ui, -apple-system, BlinkMacSystemFont, Arial, sans-serif" 
+          font-weight="500" 
+          font-size="28" 
+          letter-spacing="1">v1.0.0 | Total Fitness, Redefined.</text>
+    <text x="0" y="32" 
+          text-anchor="middle" 
+          fill="#666666" 
+          font-family="system-ui, -apple-system, BlinkMacSystemFont, Arial, sans-serif" 
+          font-weight="400" 
+          font-size="20" 
+          letter-spacing="0.5">Your Total Fitness Partner</text>
+  </g>
+</svg>
