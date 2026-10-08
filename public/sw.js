@@ -26,10 +26,18 @@ self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
   const url = new URL(event.request.url);
 
-  // Network-first for dynamic API routes
+  // Network-only for dynamic API routes with JSON error fallback
   if (url.pathname.startsWith('/api/')) {
     event.respondWith(
-      fetch(event.request).catch(() => caches.match(event.request))
+      fetch(event.request).catch(() => {
+        return new Response(
+          JSON.stringify({ error: 'You are currently offline or the server is unavailable.' }),
+          {
+            status: 503,
+            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+          }
+        );
+      })
     );
     return;
   }

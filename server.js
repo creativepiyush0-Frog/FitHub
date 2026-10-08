@@ -1949,9 +1949,19 @@ function renderWebApp() {
       if (body) options.body = JSON.stringify(body);
 
       const res = await fetch(endpoint, options);
-      const data = await res.json();
+      const text = await res.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (parseErr) {
+        if (!res.ok) {
+          throw new Error('Server returned an unexpected response (Status ' + res.status + '). Please try again.');
+        }
+        throw new Error('Invalid response received from server.');
+      }
+
       if (!res.ok) {
-        throw new Error(data.error || 'Server error');
+        throw new Error(data.error || 'Server error (' + res.status + ')');
       }
       return data;
     }
